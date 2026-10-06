@@ -150,7 +150,7 @@ impl SeedSource {
             SeedSource::List(queue) => queue.lock().unwrap().pop_front(),
             SeedSource::Count(remaining) => {
                 remaining
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                     .ok()?;
                 Some(rand::thread_rng().r#gen())
             }
