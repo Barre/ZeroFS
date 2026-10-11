@@ -94,9 +94,18 @@ impl ZeroFS {
             SetUid::NoChange => creds.uid,
         };
 
+        // BSD group semantics: a setgid parent directory makes new entries
+        // inherit its group, symlinks included. The setgid bit itself is not
+        // inherited, matching Linux.
         let gid = match &attr.gid {
             SetGid::Set(g) => *g,
-            SetGid::NoChange => creds.gid,
+            SetGid::NoChange => {
+                if dir.mode & 0o2000 != 0 {
+                    dir.gid
+                } else {
+                    creds.gid
+                }
+            }
         };
 
         let (now_sec, now_nsec) = get_current_time();
@@ -433,7 +442,7 @@ mod tests {
     use crate::test_helpers::test_helpers_mod::test_auth;
 
     use crate::fs::store::inode::MAX_HARDLINKS_PER_INODE;
-    use crate::fs::types::{FileType, SetAttributes};
+    use crate::fs::types::{FileType, SetAttributes, SetGid, SetMode};
     use futures::StreamExt;
 
     async fn readlink_at(fs: &ZeroFS, dirid: InodeId, name: &[u8]) -> Vec<u8> {
@@ -827,6 +836,79 @@ mod tests {
             Inode::File(file) => {
                 assert_eq!(file.nlink, MAX_HARDLINKS_PER_INODE);
             }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn symlink_inherits_setgid_parent_group() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (dir, _) = fs
+            .mkdir(
+                &test_creds(),
+                0,
+                b"sgid",
+                &SetAttributes {
+                    mode: SetMode::Set(0o2775),
+                    gid: SetGid::Set(2000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let (_, attrs) = fs
+            .symlink(
+                &test_creds(),
+                dir,
+                b"target",
+                b"link",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+
+        // test_creds has gid 1000, so 2000 can only have come from the parent.
+        assert_eq!(attrs.gid, 2000, "symlink should inherit the setgid group");
+    }
+
+    #[tokio::test]
+    async fn hardlink_keeps_source_group() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (dir, _) = fs
+            .mkdir(
+                &test_creds(),
+                0,
+                b"sgid",
+                &SetAttributes {
+                    mode: SetMode::Set(0o2775),
+                    gid: SetGid::Set(1000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (src, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"src",
+                &SetAttributes {
+                    gid: SetGid::Set(555),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // A hard link shares the inode, so it keeps the source's group
+        // rather than picking up the setgid parent's.
+        fs.link(&(&test_auth()).into(), src, dir, b"hard")
+            .await
+            .unwrap();
+        let inode = fs.inode_store.get(src).await.unwrap();
+        match inode {
+            Inode::File(file) => assert_eq!(file.gid, 555, "hard link must not change the group"),
             _ => panic!("Expected file inode"),
         }
     }
