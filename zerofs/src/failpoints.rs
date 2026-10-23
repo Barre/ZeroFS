@@ -124,10 +124,10 @@ pub async fn widen(point: &'static str) {
 /// overwrites the repoint CAS must reject.
 pub const REPACK_BETWEEN_REPOINTS: &str = "repack_between_repoints";
 
-/// A reclamation cycle, after the directory verify and before the
-/// irreversible object delete. Widening it tests the "no frame points here
-/// is a permanent verdict" claim the delete rests on.
-pub const RECLAIM_AFTER_VERIFY_BEFORE_DELETE: &str = "reclaim_after_verify_before_delete";
+/// A reclamation cycle, after the dead-counter recheck and before the
+/// irreversible object delete. Widening it tests the claim the delete rests
+/// on: a segment sealed before the cutoff cannot gain a reference.
+pub const RECLAIM_AFTER_RECHECK_BEFORE_DELETE: &str = "reclaim_after_recheck_before_delete";
 
 /// The coalesced run read, after the FrameLocs are resolved and before the
 /// segment GET. Widening it lets a repoint+delete 404 the segment mid-read,

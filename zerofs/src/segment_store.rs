@@ -303,7 +303,10 @@ impl SegmentStore {
         self.object_store
             .delete(&Path::from(segid.object_key()))
             .await
-            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))
+            .map_err(|e| match e {
+                slatedb::object_store::Error::NotFound { .. } => SegmentStoreError::NotFound,
+                other => SegmentStoreError::ObjectStore(other.to_string()),
+            })
     }
 
     /// Read and decrypt the directory mapping frames to logical extents.
