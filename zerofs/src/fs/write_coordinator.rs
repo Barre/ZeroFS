@@ -230,6 +230,7 @@ impl WeakWriteCoordinator {
 /// The commit worker is the sole writer of these keys. `total` is monotonic.
 async fn stage_seg_deltas(
     db: &Db,
+    key_codec: &KeyCodec,
     deltas: BTreeMap<bytes::Bytes, (i64, i64)>,
     batch: &mut WriteBatch,
 ) -> Result<StagedSegcounts, FsError> {
@@ -253,9 +254,28 @@ async fn stage_seg_deltas(
     let mut footprint_delta = SegmentFootprintDelta::default();
     let mut reclaim_changed = false;
     for (key, (net_live, net_total), (cur_live, cur_total)) in bases {
-        let live = (cur_live as i128 + net_live as i128).max(0) as u64;
         // `total` is monotonic: clamp to at least its current value.
         let total = (cur_total as i128 + net_total as i128).max(cur_total as i128) as u64;
+        let live = cur_live as i128 + net_live as i128;
+        let live = if live < 0 {
+            // Debiting more than was credited means the counter under-counted
+            // a frame that was still referenced. Reclamation deletes on the
+            // counter alone, so pin the segment.
+            tracing::error!(
+                "segment accounting BUG: live-byte counter for {:?} would underflow \
+                 ({cur_live} live, {net_live} delta); keeping it out of counter-based \
+                 reclamation. Please report this at https://github.com/Barre/ZeroFS/issues",
+                key_codec.parse_segcount_key(&key)
+            );
+            if total == 0 {
+                // No counter and no credit: write nothing, so the object stays
+                // with the orphan sweep, which verifies every pointer.
+                continue;
+            }
+            total
+        } else {
+            live as u64
+        };
         // Monitoring deltas use the clamped absolute values and saturating sums.
         footprint_delta.merge(SegmentFootprintDelta::new(
             (cur_total == 0 && total > 0) as i64,
@@ -441,7 +461,7 @@ async fn worker_loop(
             absolute: seg_abs,
             footprint: mut footprint_delta,
             reclaim_changed,
-        } = match stage_seg_deltas(&ctx.db, seg_map, &mut merged).await {
+        } = match stage_seg_deltas(&ctx.db, &ctx.key_codec, seg_map, &mut merged).await {
             Ok(staged) => staged,
             Err(e) => {
                 // A failed staged counter may have advanced the in-memory inode
