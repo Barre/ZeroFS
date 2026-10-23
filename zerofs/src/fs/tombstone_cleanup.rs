@@ -3,10 +3,12 @@
 use crate::db::Transaction;
 use crate::fs::EXTENT_SIZE;
 use crate::fs::errors::FsError;
+use crate::fs::inode::InodeId;
 use crate::fs::metrics::FileSystemStats;
 use crate::fs::store::{ExtentStore, TombstoneStore};
 use crate::task::{spawn_named, spawn_named_on};
 use bytes::Bytes;
+use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -21,6 +23,24 @@ use fp::fail_point;
 
 const MAX_EXTENTS_PER_ROUND: usize = 10_000;
 const MAX_TOMBSTONES_PER_ROUND: usize = 10_000;
+/// Files deleted at once. Distinct inodes share no lock, so their commits
+/// can merge into one coordinator batch instead of one round trip per file.
+const PARALLEL_TOMBSTONE_DELETES: usize = 16;
+
+/// One tombstone's extent range planned for this round.
+struct ExtentDeletion {
+    key: Bytes,
+    inode_id: InodeId,
+    start_extent: u64,
+    end_extent: u64,
+}
+
+impl ExtentDeletion {
+    /// Deletions run from the end of the file, so the last one reaches extent 0.
+    fn is_final(&self) -> bool {
+        self.start_extent == 0
+    }
+}
 
 pub struct TombstoneCleaner {
     tombstone_store: TombstoneStore,
@@ -89,80 +109,79 @@ impl TombstoneCleaner {
             // Empty tombstones have no extent work to share a commit with.
             let mut empty_tombstones = Transaction::new();
             let mut empty_tombstones_removed = 0;
-            let mut extents_deleted_this_round = 0;
-            let mut tombstones_completed_this_round = 0;
+            let mut extents_planned = 0;
             let mut tombstones_scanned = 0;
+            let mut deletions = Vec::new();
 
-            let iter = self.tombstone_store.list_from(resume_from.take()).await?;
-            futures::pin_mut!(iter);
+            {
+                let iter = self.tombstone_store.list_from(resume_from.take()).await?;
+                futures::pin_mut!(iter);
 
-            while let Some(result) = futures::StreamExt::next(&mut iter).await {
-                let entry = result?;
-                if tombstones_scanned == MAX_TOMBSTONES_PER_ROUND {
-                    resume_from = Some(entry.key);
-                    break;
+                while let Some(result) = iter.next().await {
+                    let entry = result?;
+                    if tombstones_scanned == MAX_TOMBSTONES_PER_ROUND {
+                        resume_from = Some(entry.key);
+                        break;
+                    }
+                    tombstones_scanned += 1;
+
+                    if tombstones_scanned % 100 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+
+                    if entry.remaining_size == 0 {
+                        self.tombstone_store
+                            .remove(&mut empty_tombstones, &entry.key);
+                        empty_tombstones_removed += 1;
+                        continue;
+                    }
+
+                    let extents_remaining_in_round = MAX_EXTENTS_PER_ROUND - extents_planned;
+                    if extents_remaining_in_round == 0 {
+                        resume_from = Some(entry.key);
+                        break;
+                    }
+
+                    let total_extents = entry.remaining_size.div_ceil(EXTENT_SIZE as u64) as usize;
+                    let extents_to_delete = total_extents.min(extents_remaining_in_round);
+                    let start_extent = total_extents - extents_to_delete;
+                    extents_planned += extents_to_delete;
+                    let deletion = ExtentDeletion {
+                        key: entry.key.clone(),
+                        inode_id: entry.inode_id,
+                        start_extent: start_extent as u64,
+                        end_extent: total_extents as u64,
+                    };
+                    let is_final = deletion.is_final();
+                    deletions.push(deletion);
+                    if !is_final {
+                        // A partial deletion spends the rest of the round's budget.
+                        resume_from = Some(entry.key);
+                        break;
+                    }
                 }
-                tombstones_scanned += 1;
+            }
 
-                if tombstones_scanned % 100 == 0 {
-                    tokio::task::yield_now().await;
-                }
-
-                if entry.remaining_size == 0 {
-                    self.tombstone_store
-                        .remove(&mut empty_tombstones, &entry.key);
-                    empty_tombstones_removed += 1;
-                    continue;
-                }
-
-                let extents_remaining_in_round = MAX_EXTENTS_PER_ROUND - extents_deleted_this_round;
-                if extents_remaining_in_round == 0 {
-                    resume_from = Some(entry.key);
-                    break;
-                }
-
-                let total_extents = entry.remaining_size.div_ceil(EXTENT_SIZE as u64) as usize;
-                let extents_to_delete = total_extents.min(extents_remaining_in_round);
-                let start_extent = total_extents - extents_to_delete;
-
-                let is_final_batch = extents_to_delete == total_extents;
-                let mut txn = Transaction::new();
-                if is_final_batch {
-                    self.tombstone_store.remove(&mut txn, &entry.key);
-                } else {
-                    self.tombstone_store.update(
-                        &mut txn,
-                        &entry.key,
-                        start_extent as u64 * EXTENT_SIZE as u64,
-                    );
-                }
-
-                // Progress, extent deletes, and counter debits commit together
-                // under the inode lock, serializing with segment repacks.
-                self.extent_store
-                    .delete_extents_and_commit(
-                        txn,
-                        entry.inode_id,
-                        start_extent as u64,
-                        total_extents as u64,
-                    )
-                    .await?;
-
-                #[cfg(feature = "failpoints")]
-                fail_point!(fp::TOMBSTONE_CLEANUP_AFTER_COMMIT);
-
-                extents_deleted_this_round += extents_to_delete;
-
-                if is_final_batch {
-                    tombstones_completed_this_round += 1;
-                } else {
-                    // A partial deletion spends the rest of the round's budget.
-                    resume_from = Some(entry.key);
-                    break;
-                }
-
-                if extents_deleted_this_round % 1000 == 0 {
-                    tokio::task::yield_now().await;
+            // Let every admitted deletion settle before reporting a failure, so
+            // the round's applied work is counted and its empties committed.
+            let mut extents_deleted_this_round = 0u64;
+            let mut tombstones_completed_this_round = 0u64;
+            let mut first_error = None;
+            let mut results = stream::iter(deletions)
+                .map(|deletion| async move {
+                    let result = self.delete_extents(&deletion).await;
+                    (deletion, result)
+                })
+                .buffer_unordered(PARALLEL_TOMBSTONE_DELETES);
+            while let Some((deletion, result)) = results.next().await {
+                match result {
+                    Ok(()) => {
+                        extents_deleted_this_round += deletion.end_extent - deletion.start_extent;
+                        tombstones_completed_this_round += u64::from(deletion.is_final());
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
                 }
             }
 
@@ -183,7 +202,7 @@ impl TombstoneCleaner {
                     .fetch_add(tombstones_completed_this_round, Ordering::Relaxed);
                 self.stats
                     .tombstone_cleanup_extents_deleted
-                    .fetch_add(extents_deleted_this_round as u64, Ordering::Relaxed);
+                    .fetch_add(extents_deleted_this_round, Ordering::Relaxed);
 
                 tracing::debug!(
                     "tombstone cleanup: completed {} tombstones, deleted {} extents",
@@ -192,6 +211,9 @@ impl TombstoneCleaner {
                 );
             }
 
+            if let Some(error) = first_error {
+                return Err(error);
+            }
             if resume_from.is_none() {
                 break;
             }
@@ -201,13 +223,42 @@ impl TombstoneCleaner {
 
         Ok(())
     }
+
+    /// Delete one tombstone's planned extent range with its progress.
+    async fn delete_extents(&self, deletion: &ExtentDeletion) -> Result<(), FsError> {
+        let mut txn = Transaction::new();
+        if deletion.is_final() {
+            self.tombstone_store.remove(&mut txn, &deletion.key);
+        } else {
+            self.tombstone_store.update(
+                &mut txn,
+                &deletion.key,
+                deletion.start_extent * EXTENT_SIZE as u64,
+            );
+        }
+
+        // Progress, extent deletes, and counter debits commit together
+        // under the inode lock, serializing with segment repacks.
+        self.extent_store
+            .delete_extents_and_commit(
+                txn,
+                deletion.inode_id,
+                deletion.start_extent,
+                deletion.end_extent,
+            )
+            .await?;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::TOMBSTONE_CLEANUP_AFTER_COMMIT);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fs::ZeroFS;
-    use crate::fs::inode::InodeId;
     use crate::fs::store::tombstone::TombstoneEntry;
     use bytes::Bytes;
 
