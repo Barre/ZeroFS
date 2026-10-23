@@ -27,7 +27,7 @@ use tracing::{debug, error, info};
 
 /// Fully-dead segments are independent after the safe cutoff; each costs one
 /// counter read and one object DELETE.
-const PARALLEL_DEAD_SEGMENT_JOBS: usize = 8;
+const PARALLEL_DEAD_SEGMENT_JOBS: usize = 32;
 
 /// Bound one counter-cleanup transaction without bounding the amount of dead
 /// work completed by a scan.
