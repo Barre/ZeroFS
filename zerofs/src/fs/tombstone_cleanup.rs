@@ -6,6 +6,7 @@ use crate::fs::errors::FsError;
 use crate::fs::metrics::FileSystemStats;
 use crate::fs::store::{ExtentStore, TombstoneStore};
 use crate::task::{spawn_named, spawn_named_on};
+use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -78,6 +79,12 @@ impl TombstoneCleaner {
             .tombstone_cleanup_runs
             .fetch_add(1, Ordering::Relaxed);
 
+        // Each round resumes at the first tombstone it did not finish, so it
+        // does not re-scan the deletion markers of the ones already removed.
+        // A tombstone landing behind the cursor (same-second key with a lower
+        // inode, or a clock step) waits for the next run, no longer than one
+        // queued after the current backlog.
+        let mut resume_from: Option<Bytes> = None;
         loop {
             // Empty tombstones have no extent work to share a commit with.
             let mut empty_tombstones = Transaction::new();
@@ -85,15 +92,14 @@ impl TombstoneCleaner {
             let mut extents_deleted_this_round = 0;
             let mut tombstones_completed_this_round = 0;
             let mut tombstones_scanned = 0;
-            let mut more_work = false;
 
-            let iter = self.tombstone_store.list().await?;
+            let iter = self.tombstone_store.list_from(resume_from.take()).await?;
             futures::pin_mut!(iter);
 
             while let Some(result) = futures::StreamExt::next(&mut iter).await {
                 let entry = result?;
                 if tombstones_scanned == MAX_TOMBSTONES_PER_ROUND {
-                    more_work = true;
+                    resume_from = Some(entry.key);
                     break;
                 }
                 tombstones_scanned += 1;
@@ -111,7 +117,7 @@ impl TombstoneCleaner {
 
                 let extents_remaining_in_round = MAX_EXTENTS_PER_ROUND - extents_deleted_this_round;
                 if extents_remaining_in_round == 0 {
-                    more_work = true;
+                    resume_from = Some(entry.key);
                     break;
                 }
 
@@ -120,9 +126,6 @@ impl TombstoneCleaner {
                 let start_extent = total_extents - extents_to_delete;
 
                 let is_final_batch = extents_to_delete == total_extents;
-                if !is_final_batch {
-                    more_work = true;
-                }
                 let mut txn = Transaction::new();
                 if is_final_batch {
                     self.tombstone_store.remove(&mut txn, &entry.key);
@@ -152,6 +155,10 @@ impl TombstoneCleaner {
 
                 if is_final_batch {
                     tombstones_completed_this_round += 1;
+                } else {
+                    // A partial deletion spends the rest of the round's budget.
+                    resume_from = Some(entry.key);
+                    break;
                 }
 
                 if extents_deleted_this_round % 1000 == 0 {
@@ -185,7 +192,7 @@ impl TombstoneCleaner {
                 );
             }
 
-            if !more_work {
+            if resume_from.is_none() {
                 break;
             }
 
@@ -200,6 +207,7 @@ impl TombstoneCleaner {
 mod tests {
     use super::*;
     use crate::fs::ZeroFS;
+    use crate::fs::inode::InodeId;
     use crate::fs::store::tombstone::TombstoneEntry;
     use bytes::Bytes;
 
@@ -270,6 +278,55 @@ mod tests {
         );
         assert_eq!(fs.stats.tombstones_processed.load(Ordering::Relaxed), 1);
         assert!(fs.stats.tombstone_cleanup_runs.load(Ordering::Relaxed) >= 1);
+    }
+
+    // Resuming must not lose work: a file larger than one round's extent
+    // budget must be finished, and the tombstone cap must not drop the
+    // entries past it.
+    #[tokio::test]
+    async fn tombstone_cleanup_resumes_across_round_boundaries() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let cleaner = cleaner_for(&fs);
+
+        // Sparse: only the first and last extents exist, so a round spends its
+        // whole budget on this file without writing 10k extents.
+        let large: InodeId = 1;
+        let large_extents = MAX_EXTENTS_PER_ROUND as u64 + 5;
+        let small: InodeId = 2;
+        let mut txn = fs.db.new_transaction().unwrap();
+        for (inode, extent) in [(large, 0), (large, large_extents - 1), (small, 0)] {
+            fs.extent_store
+                .write(
+                    &mut txn,
+                    inode,
+                    extent * EXTENT_SIZE as u64,
+                    &Bytes::from(vec![1u8; EXTENT_SIZE]),
+                    extent * EXTENT_SIZE as u64,
+                )
+                .await
+                .unwrap();
+        }
+        fs.tombstone_store
+            .add(&mut txn, large, large_extents * EXTENT_SIZE as u64);
+        fs.tombstone_store.add(&mut txn, small, EXTENT_SIZE as u64);
+        for inode in 100..100 + MAX_TOMBSTONES_PER_ROUND as u64 {
+            fs.tombstone_store.add(&mut txn, inode, 0);
+        }
+        fs.write_coordinator.commit(txn).await.unwrap();
+
+        cleaner.run().await.unwrap();
+
+        for (inode, extent) in [(large, 0), (large, large_extents - 1), (small, 0)] {
+            assert!(
+                fs.extent_store.get(inode, extent).await.unwrap().is_none(),
+                "extent {inode}:{extent} must be reclaimed"
+            );
+        }
+        assert!(tombstones(&fs.tombstone_store).await.is_empty());
+        assert_eq!(
+            fs.stats.tombstones_processed.load(Ordering::Relaxed),
+            2 + MAX_TOMBSTONES_PER_ROUND as u64
+        );
     }
 
     #[tokio::test]

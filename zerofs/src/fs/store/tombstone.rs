@@ -43,7 +43,17 @@ impl TombstoneStore {
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<TombstoneEntry, FsError>> + Send + '_>>, FsError>
     {
+        self.list_from(None).await
+    }
+
+    /// List tombstones from `from` (inclusive), or from the first one.
+    pub async fn list_from(
+        &self,
+        from: Option<Bytes>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<TombstoneEntry, FsError>> + Send + '_>>, FsError>
+    {
         let (start, end) = self.key_codec.prefix_range(KeyPrefix::Tombstone);
+        let start = from.unwrap_or(start);
         let codec = self.key_codec.clone();
 
         let iter = self
