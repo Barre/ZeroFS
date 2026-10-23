@@ -65,7 +65,7 @@ pub(crate) const POINTS: &[&str] = &[
 /// so concurrent commits can land inside it (see zerofs::failpoints::widen).
 pub(crate) const WIDEN_POINTS: &[&str] = &[
     zerofs::failpoints::RECLAIM_AFTER_BARRIER_BEFORE_SCAN,
-    zerofs::failpoints::RECLAIM_AFTER_VERIFY_BEFORE_DELETE,
+    zerofs::failpoints::RECLAIM_AFTER_RECHECK_BEFORE_DELETE,
     zerofs::failpoints::REPACK_AFTER_SEAL_BEFORE_REPOINT,
     zerofs::failpoints::REPACK_BETWEEN_REPOINTS,
     zerofs::failpoints::READ_AFTER_RESOLVE_BEFORE_FETCH,

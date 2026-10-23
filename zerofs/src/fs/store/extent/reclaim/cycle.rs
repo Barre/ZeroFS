@@ -1,5 +1,5 @@
 //! Counter-based reclamation cycles and the slow orphan sweep. Cycles scan
-//! durable counters, verify and delete dead segments, and run repack jobs; the
+//! durable counters, delete dead segments, and run repack jobs; the
 //! separately scheduled orphan sweep is the only path that LISTs the store.
 
 #[cfg(feature = "failpoints")]
@@ -25,9 +25,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
-/// Fully-dead segments are independent after the safe cutoff. Keep this below
-/// the per-segment pointer-lookup fan-out so one deletion set cannot swamp the
-/// metadata store while still overlapping object GETs and DELETEs.
+/// Fully-dead segments are independent after the safe cutoff; each costs one
+/// counter read and one object DELETE.
 const PARALLEL_DEAD_SEGMENT_JOBS: usize = 8;
 
 /// Bound one counter-cleanup transaction without bounding the amount of dead
@@ -304,8 +303,8 @@ enum DeadOutcome {
     /// Object already absent (a crash between DELETE and the counter drop);
     /// drop the leaked counter.
     CounterOnly { segid: Segid, total: u64 },
-    /// Still referenced, or its counter changed underneath the scan: keep
-    /// object and counter and report the invariant breach.
+    /// Its counter changed underneath the scan: keep object and counter and
+    /// report the issue.
     Kept,
 }
 
@@ -316,11 +315,11 @@ struct DeadSweep {
     reclaimed_bytes: u64,
     deleted: usize,
     deleted_bytes: u64,
-    /// A verification or DELETE failed; the segment keeps its deadline.
+    /// A counter recheck or DELETE failed; the segment keeps its deadline.
     failed: bool,
 }
 
-/// Verify and delete due segments with bounded concurrency.
+/// Delete due segments with bounded concurrency.
 async fn delete_due_segments(
     store: &ExtentStore,
     due: Vec<Segid>,
@@ -414,9 +413,9 @@ async fn run_repack_jobs(
 }
 
 /// Drop deleted segments' counters, else one segcount key leaks per segment
-/// ever created. Verification rechecked each row after proving the segment
-/// unreferenced, and eligibility keeps `(0, total)` stable: packs mint fresh
-/// ids and writers credit only the open segment.
+/// ever created. Each row was rechecked before its DELETE, and eligibility
+/// keeps `(0, total)` stable: packs mint fresh ids and writers credit only the
+/// open segment.
 async fn drop_dead_counters(store: &ExtentStore, freed: &[(Segid, u64)]) -> Result<(), FsError> {
     for chunk in freed.chunks(SEGCOUNT_DROPS_PER_COMMIT) {
         let mut txn = store.db.new_transaction()?;
@@ -662,31 +661,14 @@ pub(super) async fn sweep_orphans_and_record(
     Ok(sweep)
 }
 
-/// Verify and retire one scan-classified dead segment. `Err` means a
-/// transient failure; the segment keeps its deadline for the next scan.
+/// Retire one scan-classified dead segment. The delete relies on the counter
+/// being exact (asserted by the DST segment-accounting check): every FrameLoc
+/// publish, overwrite and delete adjusts it in the same batch, and nothing can
+/// credit a segment sealed before the cutoff, so `live == 0` in the durable
+/// scan means no pointer references it. `Err` means a transient failure; the
+/// segment keeps its deadline for the next scan.
 async fn reclaim_dead_segment(store: &ExtentStore, segid: Segid) -> Result<DeadOutcome, FsError> {
-    let verdict = match verify_segment_reclaimable(store, segid).await {
-        Ok(verdict) => verdict,
-        Err(error) => {
-            error!("segment reclamation: verification of {segid:?} failed; retrying next scan");
-            return Err(error);
-        }
-    };
-    match verdict {
-        SegmentDeadVerdict::Referenced => {
-            // The counter under-counted: leak beats loss.
-            error!(
-                "segment reclamation BUG: refused to delete {segid:?}: its counter says zero-live, \
-                 but an extent still references it. Data was kept. Please report this at \
-                 https://github.com/Barre/ZeroFS/issues"
-            );
-            return Ok(DeadOutcome::Kept);
-        }
-        SegmentDeadVerdict::Reclaim | SegmentDeadVerdict::ObjectAbsent => {}
-    }
-
-    // The publication barrier makes a new credit impossible for an eligible
-    // segment, but never turn an observed invariant breach into object loss.
+    // Never turn an observed invariant breach into object loss.
     let counter_key = store.key_codec.segcount_key(segid.epoch, segid.counter);
     let total = match store.db.get_bytes(&counter_key).await {
         Ok(Some(value)) => match KeyCodec::decode_segcount(&value) {
@@ -716,24 +698,25 @@ async fn reclaim_dead_segment(store: &ExtentStore, segid: Segid) -> Result<DeadO
         }
     };
 
-    if matches!(verdict, SegmentDeadVerdict::ObjectAbsent) {
-        return Ok(DeadOutcome::CounterOnly { segid, total });
-    }
-
     #[cfg(feature = "failpoints")]
     {
-        fail_point!(fp::RECLAIM_AFTER_VERIFY_BEFORE_DELETE);
-        fp::widen(fp::RECLAIM_AFTER_VERIFY_BEFORE_DELETE).await;
+        fail_point!(fp::RECLAIM_AFTER_RECHECK_BEFORE_DELETE);
+        fp::widen(fp::RECLAIM_AFTER_RECHECK_BEFORE_DELETE).await;
     }
     let delete_result = {
         let _delete = store.segment_reclaim_stats.begin_delete();
         store.segments.delete_segment(segid).await
     };
-    if let Err(e) = delete_result {
-        error!(
-            "segment reclamation: delete of {segid:?} failed: {e}; skipping (retried next scan)"
-        );
-        return Err(FsError::IoError);
+    match delete_result {
+        Ok(()) => {}
+        // A crash between DELETE and the counter drop; S3 reports success.
+        Err(SegmentStoreError::NotFound) => return Ok(DeadOutcome::CounterOnly { segid, total }),
+        Err(e) => {
+            error!(
+                "segment reclamation: delete of {segid:?} failed: {e}; skipping (retried next scan)"
+            );
+            return Err(FsError::IoError);
+        }
     }
 
     #[cfg(feature = "failpoints")]
@@ -750,8 +733,7 @@ async fn reclaim_dead_segment(store: &ExtentStore, segid: Segid) -> Result<DeadO
     Ok(DeadOutcome::Deleted { segid, total })
 }
 
-/// Outcome of checking whether a segment the counter calls dead is truly
-/// reclaimable.
+/// Outcome of checking whether an uncounted segment is reclaimable.
 enum SegmentDeadVerdict {
     /// Object present, directory read OK, no extent still points here.
     Reclaim,
@@ -761,9 +743,9 @@ enum SegmentDeadVerdict {
     Referenced,
 }
 
-/// Confirm a dead segment truly holds no live-referenced frame. Each pointer is
-/// checked in both the current and durable views; any uncertainty keeps the
-/// segment.
+/// Confirm an orphan holds no live-referenced frame. An absent counter has no
+/// accounting to trust, so each pointer is checked in both the current and
+/// durable views; any uncertainty keeps the segment.
 async fn verify_segment_reclaimable(
     store: &ExtentStore,
     segid: Segid,
@@ -1029,72 +1011,8 @@ mod tests {
         }
     }
 
-    // Directory verification refuses to delete a segment the counter wrongly
-    // calls dead while a frame is still referenced.
     #[tokio::test]
-    async fn directory_verify_blocks_deleting_an_undercounted_live_segment() {
-        let (store, db) = make().await;
-        let mut model = Vec::new();
-        write_and_check(&store, &db, &mut model, 0, &[1u8; 1000]).await;
-        store.seal_open().await.unwrap();
-        let seg = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
-        assert_eq!(store.segments.list_segments().await.unwrap().len(), 1);
-
-        // Simulate an under-count: force live to zero while the extent lives (total
-        // is left nonzero, as a real segment's would be).
-        let key = store.key_codec.segcount_key(seg.epoch, seg.counter);
-        let mut txn = db.new_transaction().unwrap();
-        txn.put_bytes(&key, KeyCodec::encode_segcount(0, 1000));
-        commit(&store, txn).await;
-
-        // Reclaim sees count 0 but the directory-verify finds extent 0 still points
-        // here, so it must not delete the segment.
-        let (deleted, _) = reclaim(&store, Instant::now(), false).await.unwrap();
-        assert_eq!(
-            deleted, 0,
-            "verify must block deleting a referenced segment"
-        );
-        assert_eq!(store.segments.list_segments().await.unwrap().len(), 1);
-        assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[1u8; 1000]);
-    }
-
-    #[tokio::test]
-    async fn directory_verify_keeps_a_segment_with_a_malformed_extent_pointer() {
-        let (store, db) = make().await;
-        let mut model = Vec::new();
-        write_and_check(&store, &db, &mut model, 0, &[1u8; 1000]).await;
-        store.seal_open().await.unwrap();
-        let seg = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
-        let (_, total) = segcount_pair_of(&store, &db, seg).await;
-
-        let mut txn = db.new_transaction().unwrap();
-        txn.put_bytes(
-            &store.key_codec.segcount_key(seg.epoch, seg.counter),
-            KeyCodec::encode_segcount(0, total),
-        );
-        txn.put_bytes(
-            &store.key_codec.extent_key(1, 0).into(),
-            Bytes::from_static(b"malformed FrameLoc"),
-        );
-        commit(&store, txn).await;
-
-        assert!(
-            reclaim(&store, Instant::now(), false).await.is_err(),
-            "an undecodable pointer must make deletion retryable"
-        );
-        assert!(store.segments.list_segments().await.unwrap().contains(&seg));
-        assert!(
-            store
-                .db
-                .get_bytes(&store.key_codec.segcount_key(seg.epoch, seg.counter))
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn transient_dead_segment_verify_retries_without_resetting_its_deadline() {
+    async fn transient_dead_segment_delete_retries_without_resetting_its_deadline() {
         let (old_store, db, object_store) =
             make_with_compression(crate::config::CompressionConfig::Lz4).await;
         drop(old_store);
@@ -1108,11 +1026,12 @@ mod tests {
         store.seal_open().await.unwrap();
 
         let expired = Instant::now();
-        faults.fail_gets(1);
+        faults.partition_writes(true);
         assert!(
             reclaim(&store, expired, false).await.is_err(),
-            "a transient verification failure must make the scan retryable"
+            "a transient DELETE failure must make the scan retryable"
         );
+        faults.partition_writes(false);
         assert_eq!(store.segments.list_segments().await.unwrap().len(), 2);
         assert_eq!(store.delete_at.lock().unwrap().get(&dead), Some(&expired));
 
