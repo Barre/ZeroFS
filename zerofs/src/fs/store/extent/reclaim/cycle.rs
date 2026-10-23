@@ -1011,6 +1011,44 @@ mod tests {
         }
     }
 
+    // A debit larger than the counter's live bytes means the counter missed a
+    // credit. Reclamation trusts the counter, so the commit worker must pin the
+    // segment fully live instead of clamping it to a dead `(0, total)` row.
+    #[tokio::test]
+    async fn underflowing_debit_pins_the_segment_live() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        write_and_check(&store, &db, &mut model, 0, &[1u8; 1000]).await;
+        store.seal_open().await.unwrap();
+        let seg = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
+        let (live, total) = segcount_pair_of(&store, &db, seg).await;
+
+        let mut txn = db.new_transaction().unwrap();
+        txn.add_seg_delta(
+            &store.key_codec.segcount_key(seg.epoch, seg.counter),
+            -(live as i64) - 1,
+            0,
+        );
+        commit(&store, txn).await;
+        assert_eq!(segcount_pair_of(&store, &db, seg).await, (total, total));
+
+        let (deleted, _) = reclaim(&store, Instant::now(), false).await.unwrap();
+        assert_eq!(deleted, 0);
+        assert!(store.segments.list_segments().await.unwrap().contains(&seg));
+        assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[1u8; 1000]);
+
+        // A debit against an absent counter writes no row, leaving the object
+        // to the orphan sweep's pointer verification.
+        let uncounted = Segid::new(seg.epoch, seg.counter + 1000);
+        let key = store
+            .key_codec
+            .segcount_key(uncounted.epoch, uncounted.counter);
+        let mut txn = db.new_transaction().unwrap();
+        txn.add_seg_delta(&key, -1, 0);
+        commit(&store, txn).await;
+        assert!(db.get_bytes(&key).await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn transient_dead_segment_delete_retries_without_resetting_its_deadline() {
         let (old_store, db, object_store) =
