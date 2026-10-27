@@ -2,8 +2,9 @@
 //!
 //! The default log filter drops the LSM engine's own per-compaction lines;
 //! this task summarizes them instead: at most one line per interval, only when
-//! compaction ran. The L0 depth rides along as the early-warning signal — a
-//! full backlog (`l0_max_ssts`) stalls writers.
+//! compaction ran. The L0 depth of each segment rides along as the
+//! early-warning signal: a segment whose L0 reaches `l0_max_ssts` stalls
+//! writers into it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,17 +40,46 @@ fn compactor_counters(recorder: &DefaultMetricsRecorder) -> (u64, u64) {
     (sum(BYTES_COMPACTED), sum(SSTS_WRITTEN))
 }
 
+/// L0 depth per segment. The manifest's own `l0()` is the unsegmented tree,
+/// which stays empty once a segment extractor routes every key, and
+/// `l0_max_ssts` applies to each segment separately.
+fn segment_l0_depths(manifest: &slatedb::VersionedManifest) -> Vec<(String, usize)> {
+    manifest
+        .segments()
+        .iter()
+        .map(|s| {
+            (
+                String::from_utf8_lossy(s.prefix()).into_owned(),
+                s.l0().len(),
+            )
+        })
+        .collect()
+}
+
+fn format_l0(l0: &[(String, usize)], l0_max: usize) -> String {
+    l0.iter()
+        .map(|(name, len)| format!("{name} {len}/{l0_max}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The digest line, or `None` when the interval saw no compaction: idle is
 /// the common case and not worth a line.
-fn digest_line(bytes_delta: u64, ssts_delta: u64, l0: usize, l0_max: usize) -> Option<String> {
+fn digest_line(
+    bytes_delta: u64,
+    ssts_delta: u64,
+    l0: &[(String, usize)],
+    l0_max: usize,
+) -> Option<String> {
     if bytes_delta == 0 && ssts_delta == 0 {
         return None;
     }
     Some(format!(
-        "metadata compaction: {} compacted into {} SSTs over the last {}s; L0 {l0}/{l0_max}",
+        "metadata compaction: {} compacted into {} SSTs over the last {}s; L0 {}",
         human_bytes(bytes_delta),
         ssts_delta,
         DIGEST_INTERVAL.as_secs(),
+        format_l0(l0, l0_max),
     ))
 }
 
@@ -69,22 +99,23 @@ pub fn spawn(
                 _ = tokio::time::sleep(DIGEST_INTERVAL) => {}
             }
             let (bytes, ssts) = compactor_counters(&recorder);
-            let l0 = status.borrow().current_manifest.l0().len();
+            let l0 = segment_l0_depths(&status.borrow().current_manifest);
             if let Some(line) = digest_line(
                 bytes.saturating_sub(prev_bytes),
                 ssts.saturating_sub(prev_ssts),
-                l0,
+                &l0,
                 l0_max_ssts,
             ) {
                 info!("{line}");
             }
             // Warn only on the crossing, not every tick, so a persistently
             // deep backlog doesn't turn the warning into noise.
-            let high = l0 >= warn_at;
+            let high = l0.iter().any(|(_, len)| *len >= warn_at);
             if high && !was_high {
                 warn!(
-                    "metadata L0 backlog at {l0}/{l0_max_ssts} SSTs; writes stall if it fills \
-                     (compaction is not keeping up)"
+                    "metadata L0 backlog at {}; writes stall if a segment fills \
+                     (compaction is not keeping up)",
+                    format_l0(&l0, l0_max_ssts)
                 );
             }
             was_high = high;
@@ -100,14 +131,15 @@ mod tests {
 
     #[test]
     fn digest_is_silent_when_idle() {
-        assert_eq!(digest_line(0, 0, 3, 256), None);
+        assert_eq!(digest_line(0, 0, &[("meta".into(), 3)], 256), None);
     }
 
     #[test]
     fn digest_reports_activity_and_l0() {
-        let line = digest_line(64 << 20, 3, 12, 256).unwrap();
+        let l0 = [("extent".into(), 40), ("meta".into(), 12)];
+        let line = digest_line(64 << 20, 3, &l0, 256).unwrap();
         assert!(line.contains("64.0 MiB"), "{line}");
         assert!(line.contains("3 SSTs"), "{line}");
-        assert!(line.contains("L0 12/256"), "{line}");
+        assert!(line.contains("L0 extent 40/256, meta 12/256"), "{line}");
     }
 }
