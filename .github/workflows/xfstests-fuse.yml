@@ -9,7 +9,7 @@ permissions:
 jobs:
   xfstests-fuse:
     name: Run xfstests on zerofs mount (FUSE)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
       - run: df -h
@@ -37,6 +37,14 @@ jobs:
       - name: Clone xfstests
         run: |
           git clone https://github.com/Barre/xfstests.git /tmp/xfstests
+          for tool in ln ls mkdir mknod od touch; do
+            gnu_tool="/usr/bin/gnu${tool}"
+            if [[ ! -x "$gnu_tool" ]]; then
+              echo "Required GNU coreutils executable is missing: $gnu_tool" >&2
+              exit 1
+            fi
+            ln -s -- "$gnu_tool" "/tmp/xfstests/$tool"
+          done
 
       - name: Build xfstests
         working-directory: /tmp/xfstests
