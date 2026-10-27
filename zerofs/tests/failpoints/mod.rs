@@ -11,12 +11,17 @@ use zerofs::db::SlateDbHandle;
 use zerofs::fs::ZeroFS;
 use zerofs::fs::permissions::Credentials;
 use zerofs::fs::store::ExtentStore;
+use zerofs::fs::store::extent::reclaim::cycle::{self, CyclePolicy, SegmentProtection};
+use zerofs::fs::store::extent::reclaim::repack;
 use zerofs::fs::types::{AuthContext, SetAttributes};
+use zerofs::manifest_publication::{
+    COORDINATED_L0_SST_SIZE_BYTES, COORDINATED_MAX_UNFLUSHED_BYTES,
+};
 use zerofs::segment::Segid;
 
 use consistency::verify_consistency;
 use zerofs::failpoints as fp;
-use zerofs::fs::gc::GarbageCollector;
+use zerofs::fs::TombstoneCleaner;
 use zerofs::fs::inode::Inode;
 use zerofs::fs::types::FileType;
 
@@ -41,16 +46,18 @@ async fn list_segments(object_store: &Arc<dyn ObjectStore>) -> Vec<Segid> {
         .unwrap()
 }
 
-async fn reclaim_now(store: &ExtentStore) -> anyhow::Result<(usize, usize)> {
-    let outcome = store
-        .reclaim_segments_gated(
-            || std::future::ready(Ok(Some((chrono::Utc::now(), None)))),
-            Some(zerofs::config::GcConfig::DEFAULT_TAIL_SCRUB_MIN_DEAD_PERCENT),
-            std::time::Duration::from_secs(5 * 60),
-            |_| false,
-            256 << 20,
-        )
-        .await?;
+async fn run_reclamation_now(store: &ExtentStore) -> anyhow::Result<(usize, usize)> {
+    let outcome = cycle::run(
+        store,
+        || std::future::ready(Ok(SegmentProtection::Until(tokio::time::Instant::now()))),
+        CyclePolicy {
+            repack_min_dead_percent: zerofs::config::ReclaimConfig::DEFAULT_REPACK_MIN_DEAD_PERCENT,
+            job_bytes: 256 << 20,
+            max_concurrent_repacks: 1,
+        },
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
     Ok((outcome.deleted, outcome.relocated))
 }
 
@@ -72,16 +79,13 @@ impl CrashTestContext {
     /// Create a new filesystem instance
     async fn create_fs(&self) -> Arc<ZeroFS> {
         let db_path = Path::from("slatedb");
-        // Mirror the production durability-critical SlateDB config (see
-        // cli/server.rs): WAL off + effectively disabled size thresholds mean the
-        // only path to a durable manifest is our seal-gated flush. Without this the
-        // harness would use SlateDB's default WAL recovery, which resurrects
-        // un-flushed writes on restart and so never exercises the barrier the data
-        // plane relies on. SlateDB requires max_unflushed_bytes > l0_sst_size_bytes.
+        // Match production: keep the WAL off and prevent size-triggered
+        // memtable flushes so only FlushCoordinator makes metadata durable.
+        // SlateDB requires max_unflushed_bytes > l0_sst_size_bytes.
         let settings = slatedb::config::Settings {
             wal_enabled: false,
-            l0_sst_size_bytes: usize::MAX - 1,
-            max_unflushed_bytes: usize::MAX,
+            l0_sst_size_bytes: COORDINATED_L0_SST_SIZE_BYTES,
+            max_unflushed_bytes: COORDINATED_MAX_UNFLUSHED_BYTES,
             l0_max_ssts: 256,
             l0_max_ssts_per_key: 256,
             ..Default::default()
@@ -895,7 +899,16 @@ async fn test_crash_rename_overwrite_after_target_delete() {
 }
 
 #[tokio::test]
-async fn test_crash_gc_after_extent_delete() {
+async fn test_crash_tombstone_cleanup_before_commit() {
+    crash_tombstone_cleanup(fp::TOMBSTONE_CLEANUP_BEFORE_COMMIT, false).await;
+}
+
+#[tokio::test]
+async fn test_crash_tombstone_cleanup_after_commit() {
+    crash_tombstone_cleanup(fp::TOMBSTONE_CLEANUP_AFTER_COMMIT, true).await;
+}
+
+async fn crash_tombstone_cleanup(point: &'static str, committed: bool) {
     let (
         _scenario,
         TestSetup {
@@ -911,90 +924,191 @@ async fn test_crash_gc_after_extent_delete() {
         .await
         .unwrap();
 
-    fs.write(&auth, file_id, 0, &Bytes::from(vec![1u8; 200_000]))
+    // A sparse file larger than the 10,000-extent cleanup budget. The first
+    // chunk deletes its tail and leaves two extents' worth of tombstone progress.
+    const EXTENTS: u64 = 10_002;
+    let extent_size = zerofs::fs::EXTENT_SIZE as u64;
+    let file_size = EXTENTS * extent_size;
+    let data = Bytes::from(vec![1u8; extent_size as usize]);
+    fs.write(&auth, file_id, 0, &data).await.unwrap();
+    fs.write(&auth, file_id, (EXTENTS - 1) * extent_size, &data)
         .await
         .unwrap();
-
-    fs.flush_coordinator.flush().await.unwrap();
-
     fs.remove(&auth, 0, b"large_file.txt").await.unwrap();
-
     fs.flush_coordinator.flush().await.unwrap();
+    let tombstone = fs
+        .tombstone_store
+        .list()
+        .await
+        .unwrap()
+        .try_next()
+        .await
+        .unwrap()
+        .expect("large file must leave a tombstone");
+    assert_eq!(tombstone.remaining_size, file_size);
+    let live_before = fs
+        .extent_store
+        .segment_reclaim_stats()
+        .live_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
 
-    fail::cfg(fp::GC_AFTER_EXTENT_DELETE, "panic").unwrap();
+    fail::cfg(point, "panic").unwrap();
 
-    let gc = Arc::new(GarbageCollector::new(
-        Arc::clone(&fs.db),
+    let cleaner = TombstoneCleaner::new(
         fs.tombstone_store.clone(),
         fs.extent_store.clone(),
         Arc::clone(&fs.stats),
-        None,
-        zerofs::fs::gc::GcTuning::default(),
-    ));
-    let handle = tokio::task::spawn(async move { gc.run().await });
-    let _ = handle.await;
+    );
+    let handle = tokio::task::spawn(async move { cleaner.run().await });
+    let error = handle
+        .await
+        .expect_err("cleanup must reach the armed failpoint");
+    assert!(error.is_panic());
+    fail::cfg(point, "off").unwrap();
 
-    fail::cfg(fp::GC_AFTER_EXTENT_DELETE, "off").unwrap();
+    let expected_remaining = if committed {
+        2 * extent_size
+    } else {
+        file_size
+    };
+    let remaining = fs
+        .tombstone_store
+        .list()
+        .await
+        .unwrap()
+        .try_next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining.remaining_size, expected_remaining);
+    assert!(fs.extent_store.get(file_id, 0).await.unwrap().is_some());
+    assert_eq!(
+        fs.extent_store
+            .get(file_id, EXTENTS - 1)
+            .await
+            .unwrap()
+            .is_none(),
+        committed
+    );
+    let live_after = fs
+        .extent_store
+        .segment_reclaim_stats()
+        .live_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if committed {
+        assert!(
+            live_after > 0 && live_after < live_before,
+            "only the tail's counter debit must apply"
+        );
+    } else {
+        assert_eq!(live_after, live_before);
+    }
+
+    // Persist the observed boundary so reopening must recover this exact
+    // prefix, then prove that another cleanup finishes without double debits.
+    fs.flush_coordinator.flush().await.unwrap();
     drop(fs);
 
     let fs_after = ctx.restart_fs().await;
+    let remaining = fs_after
+        .tombstone_store
+        .list()
+        .await
+        .unwrap()
+        .try_next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining.remaining_size, expected_remaining);
     let report = verify_consistency(&fs_after).await.unwrap();
-
     assert!(report.is_consistent(), "Inconsistent:\n{report}");
+    TombstoneCleaner::new(
+        fs_after.tombstone_store.clone(),
+        fs_after.extent_store.clone(),
+        Arc::clone(&fs_after.stats),
+    )
+    .run()
+    .await
+    .unwrap();
+    assert!(
+        fs_after
+            .tombstone_store
+            .list()
+            .await
+            .unwrap()
+            .try_next()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fs_after
+            .extent_store
+            .get(file_id, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fs_after
+            .extent_store
+            .get(file_id, EXTENTS - 1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fs_after
+            .extent_store
+            .segment_reclaim_stats()
+            .live_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(verify_consistency(&fs_after).await.unwrap().is_consistent());
 }
 
 #[tokio::test]
-async fn test_crash_gc_after_tombstone_update() {
-    let (
-        _scenario,
-        TestSetup {
-            ctx,
-            fs,
-            creds,
-            auth,
-        },
-    ) = TestSetup::new().await;
+async fn test_tombstone_cleanup_batches_empty_tombstones() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let (file_id, _) = fs
-        .create(&creds, 0, b"to_delete.txt", &SetAttributes::default())
-        .await
-        .unwrap();
+    let _scenario = fail::FailScenario::setup();
+    let ctx = CrashTestContext::new();
+    let fs = ctx.create_fs().await;
+    let mut txn = zerofs::db::Transaction::new();
+    for inode in 1..=10_001 {
+        fs.tombstone_store.add(&mut txn, inode, 0);
+    }
+    fs.write_coordinator.commit(txn).await.unwrap();
 
-    fs.write(&auth, file_id, 0, &Bytes::from(vec![1u8; 100_000]))
-        .await
-        .unwrap();
-
-    fs.flush_coordinator.flush().await.unwrap();
-    fs.remove(&auth, 0, b"to_delete.txt").await.unwrap();
-    fs.flush_coordinator.flush().await.unwrap();
-
-    fail::cfg(fp::GC_AFTER_TOMBSTONE_UPDATE, "panic").unwrap();
-
-    let gc = Arc::new(GarbageCollector::new(
-        Arc::clone(&fs.db),
+    let commits = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&commits);
+    fail::cfg_callback(fp::TOMBSTONE_CLEANUP_AFTER_COMMIT, move || {
+        counted.fetch_add(1, Ordering::Relaxed);
+    })
+    .unwrap();
+    TombstoneCleaner::new(
         fs.tombstone_store.clone(),
         fs.extent_store.clone(),
         Arc::clone(&fs.stats),
-        None,
-        zerofs::fs::gc::GcTuning::default(),
-    ));
-    let handle = tokio::task::spawn(async move { gc.run().await });
-    let _ = handle.await;
-
-    fail::cfg(fp::GC_AFTER_TOMBSTONE_UPDATE, "off").unwrap();
-    drop(fs);
-
-    let fs_after = ctx.restart_fs().await;
-    let report = verify_consistency(&fs_after).await.unwrap();
-
-    println!(
-        "Report after crash at GC_AFTER_TOMBSTONE_UPDATE:\n{}",
-        report
+    )
+    .run()
+    .await
+    .unwrap();
+    assert_eq!(commits.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        fs.stats.tombstones_processed.load(Ordering::Relaxed),
+        10_001
     );
     assert!(
-        report.is_consistent(),
-        "Filesystem should be consistent after crash at gc_after_tombstone_update: {:?}",
-        report.errors
+        fs.tombstone_store
+            .list()
+            .await
+            .unwrap()
+            .try_next()
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -3072,11 +3186,11 @@ async fn test_crash_flush_after_seal_before_manifest() {
     assert!(report.is_consistent(), "Inconsistent:\n{report}");
 }
 
-/// Crash mid-compaction, after the packed segment is sealed + PUT but before any
+/// Crash mid-repack, after the packed segment is sealed + PUT but before any
 /// extent is repointed to it. The repoint never commits, so every source frame stays
 /// live and readable (no relocated data lost); the packed segment is orphaned.
 #[tokio::test]
-async fn test_crash_compact_after_seal_before_repoint() {
+async fn test_crash_repack_after_seal_before_repoint() {
     let (
         _scenario,
         TestSetup {
@@ -3103,12 +3217,11 @@ async fn test_crash_compact_after_seal_before_repoint() {
     fs.flush_coordinator.flush().await.unwrap();
 
     let segids = list_segments(&ctx.object_store).await;
-    fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "panic").unwrap();
+    fail::cfg(fp::REPACK_AFTER_SEAL_BEFORE_REPOINT, "panic").unwrap();
     let es = fs.extent_store.clone();
-    let handle =
-        tokio::task::spawn(async move { es.compact_segments(&segids, &[], 256 << 20).await });
+    let handle = tokio::task::spawn(async move { repack::run(&es, &segids, 256 << 20).await });
     let _ = handle.await;
-    fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "off").unwrap();
+    fail::cfg(fp::REPACK_AFTER_SEAL_BEFORE_REPOINT, "off").unwrap();
     drop(fs);
 
     let fs_after = ctx.restart_fs().await;
@@ -3116,22 +3229,17 @@ async fn test_crash_compact_after_seal_before_repoint() {
     assert!(report.is_consistent(), "Inconsistent:\n{report}");
     // Extent 0 still resolves to B's live frame: the current content survived.
     let data = fs_after.extent_store.read(file_id, 0, 4096).await.unwrap();
-    assert_eq!(
-        &data[..],
-        &vec![2u8; 4096][..],
-        "compaction crash lost data"
-    );
+    assert_eq!(&data[..], &[2u8; 4096], "repack crash lost data");
 }
 
-/// An overwrite whose commit lands between compaction's gather and its repoint,
+/// An overwrite whose commit lands between repack's gather and its repoint,
 /// with both frames in the same source segment (any rewrite within one seal
 /// window). The gather resolves the pointer to the old frame; the repoint's
 /// conditional swap must then reject the move, or it reverts the extent to the
-/// old frame's content and the acked overwrite is lost. The pause failpoint
-/// models the commit worker stalled (semi-sync ship, sync-writes flush queued
-/// behind the GC barrier) while the pass runs.
+/// old frame's content and the acked overwrite is lost. The failpoint pauses
+/// repack after the packed PUT so the overwrite can commit before repoint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_compact_repoint_rejects_overwrite_committed_during_pack() {
+async fn test_repack_repoint_rejects_overwrite_committed_during_pack() {
     let (
         _scenario,
         TestSetup {
@@ -3162,16 +3270,15 @@ async fn test_compact_repoint_rejects_overwrite_committed_during_pack() {
     let sources = list_segments(&ctx.object_store).await;
     assert_eq!(sources.len(), 1, "both frames must share one segment");
 
-    // Compact the source; the gather resolves frame a and packs its bytes,
+    // Repack the source; the gather resolves frame a and packs its bytes,
     // then parks after the packed PUT, before the repoint.
-    fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "pause").unwrap();
+    fail::cfg(fp::REPACK_AFTER_SEAL_BEFORE_REPOINT, "pause").unwrap();
     let es = fs.extent_store.clone();
-    let handle =
-        tokio::task::spawn(async move { es.compact_segments(&sources, &[], 256 << 20).await });
+    let handle = tokio::task::spawn(async move { repack::run(&es, &sources, 256 << 20).await });
     let mut waited = 0;
     while list_segments(&ctx.object_store).await.len() < 2 {
         waited += 1;
-        assert!(waited < 500, "compaction never reached the packed PUT");
+        assert!(waited < 500, "repack never reached the packed PUT");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
@@ -3184,7 +3291,7 @@ async fn test_compact_repoint_rejects_overwrite_committed_during_pack() {
         "overwrite visible pre-repoint"
     );
 
-    fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "off").unwrap();
+    fail::cfg(fp::REPACK_AFTER_SEAL_BEFORE_REPOINT, "off").unwrap();
     handle.await.unwrap().unwrap();
 
     let data = fs.extent_store.read(file_id, 0, 4096).await.unwrap();
@@ -3198,8 +3305,7 @@ async fn test_compact_repoint_rejects_overwrite_committed_during_pack() {
 /// Reclaim classifies deadness from the durable view, and this harness runs the
 /// production SlateDB config (WAL off, size-freeze off), where durable rows come
 /// only from the barrier's own flush. A dead segment must still be deleted in
-/// one pass here proving the durable scan sees barrier-flushed deaths while
-/// a kill committed after the barrier must defer and not delete.
+/// one scan here, proving the durable view sees barrier-flushed deaths.
 #[tokio::test]
 async fn test_reclaim_deletes_from_the_durable_view_without_a_wal() {
     let (
@@ -3227,10 +3333,10 @@ async fn test_reclaim_deletes_from_the_durable_view_without_a_wal() {
     fs.flush_coordinator.flush().await.unwrap();
     assert_eq!(list_segments(&ctx.object_store).await.len(), 2);
 
-    let (deleted, _) = reclaim_now(&fs.extent_store).await.unwrap();
+    let (deleted, _) = run_reclamation_now(&fs.extent_store).await.unwrap();
     assert_eq!(
         deleted, 1,
-        "the durable scan must see the barrier-flushed death and delete in one pass"
+        "the durable scan must see the barrier-flushed death and delete immediately"
     );
     assert_eq!(list_segments(&ctx.object_store).await.len(), 1);
     let data = fs.extent_store.read(file_id, 0, 4096).await.unwrap();
@@ -3238,9 +3344,9 @@ async fn test_reclaim_deletes_from_the_durable_view_without_a_wal() {
 }
 
 /// Crash mid-reclaim, after a dead segment's object is deleted but before its
-/// `segcount` counter key is dropped. The segment was directory-verified dead, so no
-/// FrameLoc dangles; the stale counter is a benign leak (a later pass ignores it, as
-/// the object is no longer listed).
+/// `segcount` counter key is dropped. The segment was directory-verified dead,
+/// so no FrameLoc dangles; a later scan observes the absent object and drops the
+/// stale counter.
 #[tokio::test]
 async fn test_crash_reclaim_after_segment_delete() {
     let (
@@ -3269,7 +3375,7 @@ async fn test_crash_reclaim_after_segment_delete() {
 
     fail::cfg(fp::RECLAIM_AFTER_SEGMENT_DELETE, "panic").unwrap();
     let es = fs.extent_store.clone();
-    let handle = tokio::task::spawn(async move { reclaim_now(&es).await });
+    let handle = tokio::task::spawn(async move { run_reclamation_now(&es).await });
     let _ = handle.await;
     fail::cfg(fp::RECLAIM_AFTER_SEGMENT_DELETE, "off").unwrap();
     drop(fs);
@@ -3342,14 +3448,11 @@ async fn test_seal_error_preserves_open_buffer() {
     assert_eq!(&after[..], &payload[..], "retried seal lost the data");
 }
 
-/// With the WAL off and l0_sst_size_bytes at MAX (the production config this
-/// harness mirrors), the only path to a durable manifest is the seal-gated
-/// flush, which PUTs the open segment before committing. So an un-flushed write is
-/// lost cleanly on a crash rather than leaving a durable FrameLoc pointing at a
-/// segment that was never PUT (a dangling 404 -> EIO). A durably-flushed file is
-/// unaffected. This is a consistency check of the un-flushed-write path under the
-/// real config; the seal-before-flush barrier that makes an *explicit* flush safe
-/// is covered by the `*_persists_after_flush` tests.
+/// Production disables the WAL and size-triggered memtable flushes, so only
+/// FlushCoordinator can make new FrameLocs durable. An unflushed write must
+/// therefore disappear after a crash instead of leaving recovered metadata that
+/// references a segment that was never PUT. The `*_persists_after_flush` tests
+/// cover the explicit-flush path.
 #[tokio::test]
 async fn test_unflushed_write_leaves_no_dangling_frameloc() {
     let (

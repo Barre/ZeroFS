@@ -39,26 +39,26 @@ A replica does not open the database for writing. It opens the metadata store in
 
 A write becomes visible on a replica after two delays:
 
-1. The writer flushes. A flush seals the open segment and uploads it, then flushes metadata; only flushed data can appear on a replica. Flushes run on client `fsync` (NFS `COMMIT`, NBD flush), when the periodic flush runs (every 30 seconds by default, `flush_interval_secs` under `[lsm]`), after every batch with `sync_writes = true`, and at the start of each segment garbage-collection pass. See [Durability](/durability).
+1. The writer flushes. A flush seals the open segment and uploads it, then flushes metadata; only flushed data can appear on a replica. Flushes run on client `fsync` (NFS `COMMIT`, NBD flush), when the periodic flush runs (every 30 seconds by default, `flush_interval_secs` under `[lsm]`), after every batch with `sync_writes = true`, and at the start of each segment-reclamation scan. See [Durability](/durability).
 2. The replica's next poll picks it up, after at most 10 seconds.
 
 Worst-case staleness is therefore the writer's flush delay plus the 10-second poll interval.
 
 The replica registers a metadata-store checkpoint with a 10-minute lifetime and renews it from the poll task. That checkpoint prevents metadata GC from deleting SSTs the replica may still read.
 
-Segment GC observes the same checkpoints. When it first sees a dead segment, it records a deletion horizon no earlier than both:
+Segment reclamation observes the same checkpoints. When it first sees a dead segment, it records a deletion horizon no earlier than both:
 
 - 60 seconds after the segment was first seen dead; and
-- the latest known ephemeral-checkpoint expiry plus 30 seconds for clock skew.
+- the longest recorded ephemeral-checkpoint span (`expire_time - create_time`) plus 30 seconds of grace, measured from the checkpoint-list observation using monotonic time.
 
-Later checkpoint renewals do not extend an already recorded horizon. A running replica remains protected by advancing its view on each poll. After a replica stops, its checkpoint expires within 10 minutes and the writer can reclaim the SSTs and segments it pinned. The checkpoint lifetime and poll interval are engine defaults, not `zerofs.toml` settings.
+The calculation uses the checkpoint's own timestamps, so an offset between reader and writer clocks cannot shorten this wait. Renewal updates expiry without changing creation time, so an old, repeatedly renewed checkpoint can delay segment reclamation longer than 10 minutes. Later checkpoint renewals do not extend an already recorded horizon. A running replica remains protected by advancing its view on each poll. After a replica stops, its checkpoint expires within 10 minutes; segment deletion still waits for its recorded monotonic deadline. The checkpoint lifetime and poll interval are engine defaults, not `zerofs.toml` settings.
 
 ## What a Replica Does Not Run
 
 Maintenance stays on the writer. A read-only instance runs none of the following:
 
 - **Metadata compaction and garbage collection**: Both attach to the read-write database instance. The LSM holds only metadata, so its compaction always runs embedded in the writer; there is no standalone compactor process. The writer compacts metadata SSTs and deletes unreferenced files; replicas only read them.
-- **ZeroFS garbage collection**: Tombstone garbage collection, segment garbage collection, and segment compaction run only on the writer. A replica never deletes or repacks segment objects. See [Garbage Collection](/garbage-collection).
+- **File-data reclamation**: Tombstone cleanup, segment reclamation, and segment repacking run only on the writer. A replica never deletes or repacks segment objects. See [Space Reclamation](/space-reclamation).
 - **The periodic flush**: A replica buffers no writes, so the flush task is not started.
 - **Checkpoint creation**: `zerofs checkpoint create` against a replica's RPC server fails with `Cannot create checkpoints in read-only mode. Start the server without --read-only or --checkpoint flags.`
 - **Metadata metrics**: The `/metrics` endpoint on a replica serves ZeroFS metrics but omits the `lsm_`-prefixed series, which come from the read-write engine. See [Prometheus Metrics](/prometheus).

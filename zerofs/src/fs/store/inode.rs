@@ -67,7 +67,7 @@ impl InodeStore {
 
         let data = self
             .db
-            .get_bytes(&key)
+            .get_bytes(key.as_ref())
             .await
             .map_err(|e| {
                 let error = FsError::from_db_error(&e);
@@ -129,14 +129,14 @@ impl InodeStore {
     ) -> Result<(), Box<bincode::ErrorKind>> {
         let key = self.key_codec.inode_key(id);
         let data = Bytes::from(bincode::serialize(inode)?);
-        txn.put_bytes(&key, data);
+        txn.put_bytes(&key.into(), data);
         txn.invalidate_cached_inode(id);
         Ok(())
     }
 
     pub fn delete(&self, txn: &mut Transaction, id: InodeId) {
         let key = self.key_codec.inode_key(id);
-        txn.delete_bytes(&key);
+        txn.delete_bytes(&key.into());
         txn.invalidate_cached_inode(id);
     }
 

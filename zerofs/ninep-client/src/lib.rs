@@ -27,7 +27,6 @@ use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use dashmap::mapref::entry::Entry;
 use dashmap::{DashMap, DashSet};
-use deku::prelude::*;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 pub use ninep_proto::NOFID;
@@ -168,7 +167,7 @@ pub enum ClientError {
     /// The server sent a reply we did not expect for the request.
     Unexpected(&'static str),
     /// A message failed to (de)serialise.
-    Codec(DekuError),
+    Codec(CodecError),
 }
 
 impl std::fmt::Display for ClientError {
@@ -1469,14 +1468,16 @@ impl NinePClient {
             let connection_epoch = conn.writer_epoch.load(Ordering::Relaxed);
             let (op_flags, ()) =
                 attempt.dispatch_frame(has_op_id, connection_epoch, |op_flags, origin_epoch| {
-                    let bytes = P9Message::new_with_op_id_flags_and_origin(
+                    let bytes = P9Message::encode_body(
                         tag,
-                        op_id,
-                        op_flags,
-                        origin_epoch,
-                        body.clone(),
+                        MutationEnvelope {
+                            op_id,
+                            flags: op_flags,
+                            origin_writer_epoch: origin_epoch,
+                        },
+                        body,
+                        true,
                     )
-                    .to_bytes_ctx(true)
                     .map_err(ClientError::Codec)?;
 
                     // Registration-to-enqueue has no cancellation point.
@@ -2408,7 +2409,7 @@ impl NinePClient {
                 fid,
                 offset,
                 count: attempted,
-                data: DekuBytes::from(data),
+                data: P9Bytes::from(data),
             }))
             .await?;
         match resp {
@@ -2578,7 +2579,7 @@ impl NinePClient {
 
     pub async fn readlink(&self, fid: u32) -> ClientResult<Vec<u8>> {
         match self.rpc(Message::Treadlink(Treadlink { fid })).await? {
-            Message::Rreadlink(r) => Ok(r.target.data),
+            Message::Rreadlink(r) => Ok(r.target.data.to_vec()),
             _ => Err(ClientError::Unexpected("readlink")),
         }
     }
@@ -2925,7 +2926,7 @@ mod target_dial_tests {
             .read_exact(&mut frame[P9_SIZE_FIELD_LEN..])
             .await
             .unwrap();
-        P9Message::from_bytes((&frame, 0)).unwrap().1
+        P9Message::from_bytes_ctx(&frame, false).unwrap()
     }
 
     async fn send_message(stream: &mut TcpStream, tag: u16, body: Message) {
@@ -3415,7 +3416,7 @@ mod session_transition_tests {
         requests
             .recv()
             .await
-            .map(|frame| P9Message::from_bytes((&frame, 0)).unwrap().1)
+            .map(|frame| P9Message::from_bytes_ctx(&frame, false).unwrap())
     }
 
     async fn recv_request(requests: &mut TestRequests, description: &str) -> P9Message {
@@ -4011,7 +4012,7 @@ mod session_transition_tests {
                 request.tag,
                 Message::Rread(Rread {
                     count: 1,
-                    data: DekuBytes::from(vec![b'x']),
+                    data: P9Bytes::from(vec![b'x']),
                 }),
             );
         });
@@ -4047,7 +4048,7 @@ mod session_transition_tests {
                 request.tag,
                 Message::Rread(Rread {
                     count: 7,
-                    data: DekuBytes::from(Bytes::from_static(b"payload")),
+                    data: P9Bytes::from(Bytes::from_static(b"payload")),
                 }),
             )
             .to_bytes()
@@ -4710,7 +4711,7 @@ mod session_transition_tests {
             sent.tag,
             Message::Rread(Rread {
                 count: 2,
-                data: DekuBytes::from(vec![b'x', b'y']),
+                data: P9Bytes::from(vec![b'x', b'y']),
             }),
         );
 

@@ -1,0 +1,59 @@
+name: Test ZeroFS Action with SeaweedFS
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+    paths-ignore:
+      - "packaging/kernel/kernels.lock.json"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-with-seaweedfs:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start SeaweedFS
+        run: bash .github/scripts/seaweedfs.sh start test-bucket
+
+      - name: Setup ZeroFS Volume
+        id: setup-zerofs
+        uses: ./
+        with:
+          object-store-url: "s3://test-bucket/github-actions-test"
+          encryption-password: "test-password-123"
+          aws-access-key-id: "zerofsadmin"
+          aws-secret-access-key: "zerofsadmin"
+          aws-endpoint: "http://localhost:9000"
+          aws-allow-http: "true"
+          aws-region: "us-east-1"
+          cache-size-gb: "1"
+          mount-path: "/mnt/zerofs-test"
+
+      - name: Test Volume Operations
+        run: |
+          echo "Testing ZeroFS volume on ${{ matrix.os }}..."
+
+          # Use the mount path from the action output
+          MOUNT_PATH="${{ steps.setup-zerofs.outputs.mount-path }}"
+          if [ -z "$MOUNT_PATH" ]; then
+            MOUNT_PATH="/mnt/zerofs-test"
+          fi
+
+          sudo mkdir -p "$MOUNT_PATH/test-dir"
+          echo "Hello from GitHub Actions on ${{ matrix.os }}!" | sudo tee "$MOUNT_PATH/test-dir/test.txt"
+          sudo cat "$MOUNT_PATH/test-dir/test.txt"
+          sudo ls -la "$MOUNT_PATH/test-dir/"
+          echo "Tests passed!"

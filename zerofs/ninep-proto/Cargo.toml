@@ -1,6 +1,6 @@
 [package]
 name = "ninep-proto"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "9P2000.L wire protocol types (shared by the ZeroFS 9P server and client)"
 license = "AGPL-3.0"
@@ -15,9 +15,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(MODULE)"] }
 
 [features]
 default = ["std"]
-owned = ["dep:bytes", "dep:deku", "deku/alloc"]
-std = ["owned", "bytes?/std", "deku?/std"]
+owned = ["dep:bytes"]
+std = ["owned", "bytes?/std"]
 
 [dependencies]
-deku = { version = "0.20", default-features = false, optional = true }
 bytes = { version = "1.10", default-features = false, optional = true }

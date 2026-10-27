@@ -30,7 +30,9 @@ The **single source of truth** for that version is the `version` field of
 **independently versioned** on their own pre-1.0 line, distinct from both the
 server's workspace version and the client-family version. They are published as
 part of the crates.io chain only because `zerofs-client` depends on them; bump
-their `Cargo.toml` versions by hand when the transport itself changes.
+their `Cargo.toml` versions and dependent version requirements when the transport
+itself changes. The release workflow publishes missing transport versions before
+`zerofs-client` and skips versions already on crates.io.
 
 ## One-command release flow
 
@@ -87,10 +89,9 @@ survive generation). `generate.sh` auto-detects `.so`/`.dylib`.
 
 ## What each registry job does
 
-- **`publish-crates`**: publishes `zerofs-client`. The transport crates
-  (`ninep-proto`, `ninep-client`) are independently versioned and published by
-  hand when they change, not on every client release, since crates.io rejects
-  re-uploading an existing version (no skip-existing flag). `zerofs-ffi` is never
+- **`publish-crates`**: publishes `ninep-proto`, `ninep-client`, then
+  `zerofs-client` in dependency order, skipping versions already on crates.io.
+  The transport crates remain independently versioned. `zerofs-ffi` is never
   published. Auth: `CARGO_REGISTRY_TOKEN`.
 - **`publish-pypi`**: builds a per-target wheel on each native runner (gnu + musl
   on linux x86_64/aarch64, plus macOS x86_64/arm64) with maturin under the
@@ -135,8 +136,8 @@ real release:
 
 - Add repository secret **`CARGO_REGISTRY_TOKEN`** (a token with publish scope).
 - The token owner must be able to publish all three crate names (`ninep-proto`,
-  `ninep-client`, `zerofs-client`). The pipeline publishes only `zerofs-client`;
-  publish the transports by hand the first time and whenever they change.
+  `ninep-client`, `zerofs-client`). The pipeline publishes any missing transport
+  versions before publishing `zerofs-client`.
   Publishes are permanent (only yankable), so the job compiles before upload (no
   `--no-verify`).
 

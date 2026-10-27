@@ -3,6 +3,46 @@
 
 use kernel::bindings;
 
+/// Select the create callback from the target's generated VFS signature.
+/// Linux 7.3 removed the final `exclusive` argument, which ZeroFS never used.
+pub(super) trait CreateCallback {
+    const CALLBACK: Self;
+}
+
+impl CreateCallback
+    for unsafe extern "C" fn(
+        *mut bindings::mnt_idmap,
+        *mut bindings::inode,
+        *mut bindings::dentry,
+        bindings::umode_t,
+    ) -> kernel::ffi::c_int
+{
+    const CALLBACK: Self = super::namespace::zerofs_create;
+}
+
+impl CreateCallback
+    for unsafe extern "C" fn(
+        *mut bindings::mnt_idmap,
+        *mut bindings::inode,
+        *mut bindings::dentry,
+        bindings::umode_t,
+        bindings::bool_,
+    ) -> kernel::ffi::c_int
+{
+    const CALLBACK: Self = zerofs_create_with_exclusive;
+}
+
+unsafe extern "C" fn zerofs_create_with_exclusive(
+    idmap: *mut bindings::mnt_idmap,
+    parent: *mut bindings::inode,
+    dentry: *mut bindings::dentry,
+    mode: bindings::umode_t,
+    _exclusive: bindings::bool_,
+) -> kernel::ffi::c_int {
+    // SAFETY: Both VFS signatures retain the locked parent and negative dentry.
+    unsafe { super::namespace::zerofs_create(idmap, parent, dentry, mode) }
+}
+
 #[allow(improper_ctypes)]
 unsafe extern "C" {
     fn zerofs_vfs_file_accessed(file: *mut bindings::file);

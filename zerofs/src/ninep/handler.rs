@@ -1,5 +1,6 @@
 use super::errors::{P9Error, P9Result};
 use super::lock_manager::{FileLock, FileLockManager, LockGuard};
+use super::response::Response;
 #[cfg(feature = "failpoints")]
 use crate::failpoints as fp;
 use crate::fs::errors::FsError;
@@ -11,7 +12,8 @@ use crate::fs::types::{
     SetMode, SetSize, SetTime, SetUid, Timestamp,
 };
 use crate::fs::{OpenHandle, ZeroFS};
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
+use bytes_utils::SegmentedBuf;
 #[cfg(feature = "failpoints")]
 use fp::fail_point;
 use ninep_proto::*;
@@ -98,6 +100,7 @@ const MAX_ANCESTOR_HOPS: u32 = 100_000;
 // Represents an open file handle
 #[derive(Debug, Clone)]
 pub struct Fid {
+    /// Names own their storage so long-lived fids cannot pin receive buffers.
     pub path: Vec<bytes::Bytes>,
     pub inode_id: InodeId,
     /// The attach root this fid descends from (the inode the originating
@@ -617,6 +620,7 @@ impl NinePHandler {
             None,
         )
         .await
+        .into_message()
     }
 
     /// Dispatch using a FIRST reservation created by the connection reader.
@@ -628,48 +632,28 @@ impl NinePHandler {
         op_origin_epoch: u64,
         msg: Message,
         received_guard: Option<crate::dedup::DedupGuard>,
-    ) -> P9Message {
+    ) -> Response {
         let zerofs_protocol = self.zerofs_protocol_enabled();
         let private_request = msg.is_zerofs_private_request();
         let has_private_envelope =
             crate::dedup::has_op_id(&op_id) || op_flags != 0 || op_origin_epoch != 0;
         if !zerofs_protocol && (private_request || has_private_envelope) {
-            return P9Message::new(
-                tag,
-                Message::Rlerror(Rlerror {
-                    ecode: P9Error::NotSupported.to_errno(),
-                }),
-            );
+            return Response::error(tag, P9Error::NotSupported.to_errno());
         }
 
         if op_flags & !ninep_proto::P9_OP_KNOWN_FLAGS != 0 {
-            return P9Message::new(
-                tag,
-                Message::Rlerror(Rlerror {
-                    ecode: ninep_proto::P9_EOPIDSTALE,
-                }),
-            );
+            return Response::error(tag, ninep_proto::P9_EOPIDSTALE);
         }
         if has_private_envelope && !msg.is_mutation() {
             // Operation envelopes are valid only on mutation messages.
-            return P9Message::new(
-                tag,
-                Message::Rlerror(Rlerror {
-                    ecode: ninep_proto::P9_EOPIDSTALE,
-                }),
-            );
+            return Response::error(tag, ninep_proto::P9_EOPIDSTALE);
         }
         let is_retry = op_flags & ninep_proto::P9_OP_FLAG_RETRY != 0;
 
         // Pre-dispatch rejection is CLEAN; loss during dispatch is ambiguous.
         let lease_gated = !matches!(msg, Message::Tversion(_));
         if lease_gated && !self.filesystem.db.permits_successful_response() {
-            return P9Message::new(
-                tag,
-                Message::Rlerror(Rlerror {
-                    ecode: ninep_proto::P9_ENOTLEADER_CLEAN,
-                }),
-            );
+            return Response::error(tag, ninep_proto::P9_ENOTLEADER_CLEAN);
         }
         // Dedup admission precedes mutation dispatch.
         let _dedup_guard = if let Some(guard) = received_guard {
@@ -685,19 +669,14 @@ impl NinePHandler {
                 Err(error) => {
                     // Authority loss while waiting for admission remains pre-dispatch.
                     if lease_gated && !self.filesystem.db.permits_successful_response() {
-                        return P9Message::new(
-                            tag,
-                            Message::Rlerror(Rlerror {
-                                ecode: ninep_proto::P9_ENOTLEADER_CLEAN,
-                            }),
-                        );
+                        return Response::error(tag, ninep_proto::P9_ENOTLEADER_CLEAN);
                     }
                     let ecode = match error {
                         crate::dedup::DedupAdmissionError::UnseenRetry => {
                             ninep_proto::P9_EOPIDSTALE
                         }
                     };
-                    return P9Message::new(tag, Message::Rlerror(Rlerror { ecode }));
+                    return Response::error(tag, ecode);
                 }
             }
         };
@@ -710,15 +689,16 @@ impl NinePHandler {
             } else {
                 ninep_proto::P9_ENOTLEADER
             };
-            return P9Message::new(tag, Message::Rlerror(Rlerror { ecode }));
+            return Response::error(tag, ecode);
         }
+        let mut payload = None;
         let result = match msg {
             Message::Tversion(tv) => self.version(tv).await,
             Message::Tattach(ta) => self.attach(ta).await,
             Message::Twalk(tw) => self.walk(tw).await,
             Message::Tlopen(tl) => self.lopen(tl).await,
             Message::Tlcreate(tc) => self.lcreate(tc, op_id).await,
-            Message::Tread(tr) => self.read(tr).await,
+            Message::Tread(tr) => self.read(tr, &mut payload).await,
             Message::Twrite(tw) => self.write(tw, op_id).await,
             Message::Tclunk(tc) => Ok(self.clunk(tc).await),
             Message::Treaddir(tr) => self.readdir(tr).await,
@@ -745,7 +725,7 @@ impl NinePHandler {
             Message::Twalkgetattr(tw) => self.walk_getattr(tw).await,
             Message::Treaddirattr(tr) => self.readdir_attr(tr).await,
             Message::Tlopenat(tl) => self.lopenat(tl).await,
-            Message::Tlopenatread(tl) => self.lopenatread(tl).await,
+            Message::Tlopenatread(tl) => self.lopenatread(tl, &mut payload).await,
             Message::Tlcreateattr(tc) => self.lcreateattr(tc, op_id).await,
             Message::Tmkdirattr(tm) => self.mkdir_attr(tm, op_id).await,
             Message::Tsymlinkattr(ts) => self.symlink_attr(ts, op_id).await,
@@ -786,20 +766,15 @@ impl NinePHandler {
 
         match result {
             Ok(body) if !lease_gated || self.filesystem.db.permits_successful_response() => {
-                P9Message::new(tag, body)
+                Response::new(P9Message::new(tag, body), payload)
             }
             // Authority loss after dispatch suppresses successful responses.
-            Ok(_) => P9Message::new(
-                tag,
-                Message::Rlerror(Rlerror {
-                    ecode: ninep_proto::P9_ENOTLEADER,
-                }),
-            ),
+            Ok(_) => Response::error(tag, ninep_proto::P9_ENOTLEADER),
             Err(e) => {
                 // CLEAN requires proof that neither replica applied the batch.
                 let ecode =
                     post_dispatch_errno(e, self.filesystem.db.permits_successful_response());
-                P9Message::new(tag, Message::Rlerror(Rlerror { ecode }))
+                Response::error(tag, ecode)
             }
         }
     }
@@ -1156,13 +1131,13 @@ impl NinePHandler {
     /// Keep a fid's absolute path in step with a walk: `..` pops a component
     /// (unless clamped at the attach root, where `current_id == root`), any
     /// other name appends. Shared by `walk` and `walk_getattr`.
-    fn step_path(path: &mut Vec<Bytes>, name: Bytes, current_id: InodeId, root: InodeId) {
-        if name.as_ref() == b".." {
+    fn step_path(path: &mut Vec<Bytes>, name: &[u8], current_id: InodeId, root: InodeId) {
+        if name == b".." {
             if current_id != root {
                 path.pop();
             }
         } else {
-            path.push(name);
+            path.push(Bytes::copy_from_slice(name));
         }
     }
 
@@ -1175,7 +1150,7 @@ impl NinePHandler {
         let has_wnames = !tw.wnames.is_empty();
 
         for (i, wname) in tw.wnames.into_iter().enumerate() {
-            let name_bytes = Bytes::from(wname.data);
+            let name_bytes = wname.data;
 
             let creds = src_fid.creds;
             let child_id = match self
@@ -1209,7 +1184,7 @@ impl NinePHandler {
                 }
             };
 
-            Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
+            Self::step_path(&mut current_path, &name_bytes, current_id, src_fid.root);
             wqids.push(inode_to_qid(&child_inode, child_id));
             current_id = child_id;
         }
@@ -1247,12 +1222,12 @@ impl NinePHandler {
         let mut last_inode = None;
 
         for wname in tw.wnames {
-            let name_bytes = Bytes::from(wname.data);
+            let name_bytes = wname.data;
             let child_id = self
                 .walk_component(&src_fid.creds, src_fid.root, current_id, &name_bytes)
                 .await?;
             let child_inode = self.filesystem.inode_store.get(child_id).await?;
-            Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
+            Self::step_path(&mut current_path, &name_bytes, current_id, src_fid.root);
             wqids.push(inode_to_qid(&child_inode, child_id));
             current_id = child_id;
             last_inode = Some(child_inode);
@@ -1390,7 +1365,11 @@ impl NinePHandler {
     // Tlopenatread = Tlopenat + a best-effort read of [0, count). The open is
     // authoritative: the inline read never fails it, so a read error returns the
     // open result with empty data (eof=0) and the client falls back to a plain Tread.
-    async fn lopenatread(&self, tl: Tlopenatread) -> P9Result<Message> {
+    async fn lopenatread(
+        &self,
+        tl: Tlopenatread,
+        payload: &mut Option<SegmentedBuf<Bytes>>,
+    ) -> P9Result<Message> {
         // Reuse the open path so the fid/handle bookkeeping is identical to Tlopenat.
         let (qid, iounit) = match self
             .lopenat(Tlopenat {
@@ -1415,24 +1394,22 @@ impl NinePHandler {
             // The open already authorized this immutable fid capability.
             // Keep an open descriptor and the inode-wide client page cache
             // consistent after chmod/chown.
-            match self
-                .filesystem
+            self.filesystem
                 .read_file_opened(new_fid.inode_id, 0, count)
                 .await
-            {
-                Ok((d, e)) => (DekuBytes::from(d), e),
-                Err(_) => (DekuBytes::default(), false),
-            }
+                .unwrap_or_default()
         } else {
-            (DekuBytes::default(), false)
+            (SegmentedBuf::new(), false)
         };
 
+        let count = data.remaining() as u32;
+        *payload = Some(data);
         Ok(Message::Rlopenatread(Rlopenatread {
             qid,
             iounit,
             eof: eof as u8,
-            count: data.len() as u32,
-            data,
+            count,
+            data: P9Bytes::default(),
         }))
     }
 
@@ -1538,7 +1515,7 @@ impl NinePHandler {
         Ok(Message::Rreaddir(
             Rreaddir::from_entries(dir_entries).unwrap_or(Rreaddir {
                 count: 0,
-                data: DekuBytes::default(),
+                data: P9Bytes::default(),
             }),
         ))
     }
@@ -1584,7 +1561,7 @@ impl NinePHandler {
         Ok(Message::Rreaddirattr(
             Rreaddirattr::from_entries(entries).unwrap_or(Rreaddirattr {
                 count: 0,
-                data: DekuBytes::default(),
+                data: P9Bytes::default(),
             }),
         ))
     }
@@ -1645,7 +1622,9 @@ impl NinePHandler {
                 return Err(P9Error::FidAlreadyOpen);
             }
             let mut opened_fid = parent_fid;
-            opened_fid.path.push(Bytes::from(tc.name.data));
+            opened_fid
+                .path
+                .push(Bytes::copy_from_slice(tc.name.as_ref()));
             opened_fid.inode_id = child_id;
             opened_fid.qid = qid;
             opened_fid.opened = true;
@@ -1676,7 +1655,7 @@ impl NinePHandler {
             .await?;
 
         let mut path = parent_fid.path;
-        path.push(Bytes::from(tc.name.data));
+        path.push(Bytes::copy_from_slice(tc.name.as_ref()));
         // The child lock orders fid publication against unlink.
         {
             let _guard = self.filesystem.lock_manager.acquire(child_id).await;
@@ -1704,7 +1683,11 @@ impl NinePHandler {
         }))
     }
 
-    async fn read(&self, tr: Tread) -> P9Result<Message> {
+    async fn read(
+        &self,
+        tr: Tread,
+        payload: &mut Option<SegmentedBuf<Bytes>>,
+    ) -> P9Result<Message> {
         let fid_entry = self.get_fid(tr.fid)?;
 
         if !fid_allows_read(&fid_entry) {
@@ -1721,9 +1704,11 @@ impl NinePHandler {
             .read_file_opened(fid_entry.inode_id, tr.offset, count)
             .await?;
 
+        let count = data.remaining() as u32;
+        *payload = Some(data);
         Ok(Message::Rread(Rread {
-            count: data.len() as u32,
-            data: DekuBytes::from(data),
+            count,
+            data: P9Bytes::default(),
         }))
     }
 
@@ -2306,7 +2291,7 @@ impl NinePHandler {
             start: tl.start,
             length: tl.length,
             proc_id: tl.proc_id,
-            client_id: tl.client_id.data.clone(),
+            client_id: tl.client_id.data.to_vec(),
             fid: tl.fid,
             inode_id: slot.fid.inode_id,
         };
@@ -2347,7 +2332,7 @@ impl NinePHandler {
             start: tg.start,
             length: tg.length,
             proc_id: tg.proc_id,
-            client_id: tg.client_id.data.clone(),
+            client_id: tg.client_id.data.to_vec(),
             fid: tg.fid,
             inode_id: fid.inode_id,
         };
@@ -2678,6 +2663,106 @@ mod tests {
             .body,
             Message::Rlcreate(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn fid_paths_release_receive_buffers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ReceiveBuffer {
+            data: Vec<u8>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl AsRef<[u8]> for ReceiveBuffer {
+            fn as_ref(&self) -> &[u8] {
+                &self.data
+            }
+        }
+
+        impl Drop for ReceiveBuffer {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for operation in ["walk", "walk_getattr", "lcreate", "lcreateattr"] {
+            let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+            let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+            start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+            if matches!(operation, "walk" | "walk_getattr") {
+                fs.create(&test_creds(), 0, b"x", &SetAttributes::default())
+                    .await
+                    .unwrap();
+            }
+
+            let name = P9String::new(Bytes::from_static(b"x"));
+            let (body, fid) = match operation {
+                "walk" => (
+                    Message::Twalk(Twalk {
+                        fid: 1,
+                        newfid: 2,
+                        nwname: 1,
+                        wnames: vec![name],
+                    }),
+                    2,
+                ),
+                "walk_getattr" => (
+                    Message::Twalkgetattr(Twalkgetattr {
+                        fid: 1,
+                        newfid: 2,
+                        nwname: 1,
+                        wnames: vec![name],
+                    }),
+                    2,
+                ),
+                "lcreate" => (
+                    Message::Tlcreate(Tlcreate {
+                        fid: 1,
+                        name,
+                        flags: O_RDWR as u32,
+                        mode: 0o644,
+                        gid: 1000,
+                    }),
+                    1,
+                ),
+                "lcreateattr" => (
+                    Message::Tlcreateattr(Tlcreateattr {
+                        dfid: 1,
+                        newfid: 2,
+                        name,
+                        flags: O_RDWR as u32,
+                        mode: 0o644,
+                        gid: 1000,
+                    }),
+                    2,
+                ),
+                _ => unreachable!(),
+            };
+            let encoded = P9Message::new(2, body).to_bytes_ctx(true).unwrap();
+            let mut data = vec![0; 8192];
+            data[..encoded.len()].copy_from_slice(&encoded);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let frame = Bytes::from_owner(ReceiveBuffer {
+                data,
+                dropped: dropped.clone(),
+            })
+            .slice(..encoded.len());
+            let message = P9Message::from_owned_bytes_ctx(frame, true).unwrap();
+            assert!(!dropped.load(Ordering::SeqCst));
+
+            let reply = request(&handler, message.tag, message.body).await;
+            assert!(
+                !matches!(reply.body, Message::Rlerror(_)),
+                "{operation}: {reply:?}"
+            );
+            let retained_fid = handler.get_fid(fid).unwrap();
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "{operation} retained its receive buffer"
+            );
+            assert_eq!(retained_fid.path, vec![Bytes::from_static(b"x")]);
+        }
     }
 
     #[tokio::test]
@@ -3297,7 +3382,7 @@ mod tests {
                 fid: 2,
                 offset: 0,
                 count: 1,
-                data: DekuBytes::from(vec![b'x']),
+                data: P9Bytes::from(vec![b'x']),
             }),
         )
         .await;
@@ -3371,7 +3456,7 @@ mod tests {
                     fid: 3,
                     offset: contents.len() as u64,
                     count: 1,
-                    data: DekuBytes::from(vec![b'!']),
+                    data: P9Bytes::from(vec![b'!']),
                 }),
             )
             .await
@@ -4110,7 +4195,7 @@ mod tests {
             fid: 2,
             offset: 1_000_000,
             count: 0,
-            data: DekuBytes::default(),
+            data: P9Bytes::default(),
         });
         let initial = handler
             .handle_message_with_op_id(4, op_id, empty_write.clone())
@@ -4171,7 +4256,7 @@ mod tests {
                 fid: 2,
                 offset: 0,
                 count: 5,
-                data: DekuBytes::from(b"hello".to_vec()),
+                data: P9Bytes::from(b"hello".to_vec()),
             }),
         )
         .await;
@@ -4559,7 +4644,7 @@ mod tests {
                 )
                 .await;
             match resp.body {
-                Message::Rversion(rv) => assert_eq!(rv.version.data, b"unknown"),
+                Message::Rversion(rv) => assert_eq!(rv.version.as_ref(), b"unknown"),
                 other => panic!("expected Rversion, got {other:?}"),
             }
             assert!(!handler.zerofs_protocol_enabled());
@@ -4658,7 +4743,7 @@ mod tests {
             fid: 2,
             offset: 0,
             count: data.len() as u32,
-            data: DekuBytes::from(data),
+            data: P9Bytes::from(data),
         });
         handler.handle_message(5, write_msg).await;
 
@@ -5039,7 +5124,7 @@ mod tests {
                     fid: 2,
                     offset: 0,
                     count: data.len() as u32,
-                    data: DekuBytes::from(data.to_vec()),
+                    data: P9Bytes::from(data.to_vec()),
                 }),
             )
             .await;
@@ -6715,7 +6800,7 @@ mod tests {
                                                     fid,
                                                     offset: 0,
                                                     count: 2,
-                                                    data: DekuBytes::from(vec![1u8, 2u8]),
+                                                    data: P9Bytes::from(vec![1u8, 2u8]),
                                                 }),
                                             )
                                             .await;

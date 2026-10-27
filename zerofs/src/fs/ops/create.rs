@@ -11,13 +11,12 @@ use crate::fs::inode::{
     DirectoryInode, FileInode, Inode, InodeId, MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR, SpecialInode,
 };
 use crate::fs::permissions::{AccessMode, Credentials, check_access, validate_mode};
-#[cfg(test)]
-use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
     AuthContext, FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetTime,
     SetUid,
 };
+use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{ZeroFS, get_current_time, validate_filename};
 use ::tracing::{debug, error};
 use std::sync::atomic::Ordering;
@@ -62,7 +61,7 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
-        let _guard = self.lock_manager.acquire(dirid).await;
+        let inode_guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_create)? {
             return Ok(result);
@@ -177,9 +176,13 @@ impl ZeroFS {
 
                 txn.add_stats_delta(file_id, 0, 1);
 
-                self.write_coordinator.commit(txn).await.inspect_err(|e| {
-                    error!("Failed to write batch: {:?}", e);
-                })?;
+                let mutation = LockedMutation::new(txn, inode_guard);
+                self.write_coordinator
+                    .commit_locked(mutation)
+                    .await
+                    .inspect_err(|e| {
+                        error!("Failed to write batch: {:?}", e);
+                    })?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CREATE_AFTER_COMMIT);
@@ -253,7 +256,7 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
-        let _guard = self.lock_manager.acquire(dirid).await;
+        let inode_guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mkdir)? {
             return Ok(result);
@@ -391,7 +394,8 @@ impl ZeroFS {
 
                 txn.add_stats_delta(new_dir_id, 0, 1);
 
-                self.write_coordinator.commit(txn).await?;
+                let mutation = LockedMutation::new(txn, inode_guard);
+                self.write_coordinator.commit_locked(mutation).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKDIR_AFTER_COMMIT);
@@ -463,7 +467,7 @@ impl ZeroFS {
             ftype
         );
 
-        let _guard = self.lock_manager.acquire(dirid).await;
+        let inode_guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mknod)? {
             return Ok(result);
@@ -581,7 +585,8 @@ impl ZeroFS {
 
                 txn.add_stats_delta(special_id, 0, 1);
 
-                self.write_coordinator.commit(txn).await?;
+                let mutation = LockedMutation::new(txn, inode_guard);
+                self.write_coordinator.commit_locked(mutation).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKNOD_AFTER_COMMIT);
@@ -605,7 +610,7 @@ impl ZeroFS {
 
 #[cfg(test)]
 mod tests {
-
+    use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
     use crate::fs::test_util::test_creds;
     use crate::fs::*;
     use crate::test_helpers::test_helpers_mod::test_auth;
@@ -642,7 +647,7 @@ mod tests {
         let entry_data = fs.db.get_bytes(&entry_key).await.unwrap().unwrap();
         let (stored_id, cookie) = KeyCodec::decode_dir_entry(&entry_data).unwrap();
         assert_eq!(stored_id, file_id);
-        assert_eq!(cookie, super::COOKIE_FIRST_ENTRY);
+        assert_eq!(cookie, COOKIE_FIRST_ENTRY);
 
         let (second_id, _) = fs
             .create(&test_creds(), 0, b"second.txt", &SetAttributes::default())
@@ -653,13 +658,13 @@ mod tests {
         let (stored_second_id, second_cookie) =
             KeyCodec::decode_dir_entry(&second_entry_data).unwrap();
         assert_eq!(stored_second_id, second_id);
-        assert_eq!(second_cookie, super::COOKIE_FIRST_ENTRY + 1);
+        assert_eq!(second_cookie, COOKIE_FIRST_ENTRY + 1);
 
         let counter_key = KeyCodec::new().dir_cookie_counter_key(0);
         let counter_data = fs.db.get_bytes(&counter_key).await.unwrap().unwrap();
         assert_eq!(
             KeyCodec::decode_counter(&counter_data).unwrap(),
-            super::COOKIE_FIRST_ENTRY + 2
+            COOKIE_FIRST_ENTRY + 2
         );
     }
 

@@ -448,7 +448,7 @@ pub struct DirEntry {
 
 impl DirEntry {
     pub(crate) fn from_plus(e: &ninep_proto::DirEntryPlus) -> Self {
-        let name_bytes = e.name.data.clone();
+        let name_bytes = e.name.data.to_vec();
         Self {
             name: String::from_utf8_lossy(&name_bytes).into_owned(),
             name_is_utf8: std::str::from_utf8(&name_bytes).is_ok(),

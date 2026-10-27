@@ -1,7 +1,6 @@
 pub mod errors;
 pub mod filter_policy;
 pub mod flush_coordinator;
-pub mod gc;
 pub mod inode;
 pub mod key_codec;
 pub mod lock_manager;
@@ -9,6 +8,7 @@ pub mod metrics;
 pub mod permissions;
 pub mod stats;
 pub mod store;
+mod tombstone_cleanup;
 pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
@@ -35,7 +35,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-pub use self::gc::GarbageCollector;
+pub use self::tombstone_cleanup::TombstoneCleaner;
 pub use handle::OpenHandle;
 
 use self::errors::FsError;
@@ -223,6 +223,7 @@ mod tests {
         let io = codec.id_offset(KeyPrefix::Inode);
         for id in [0u64, 42, 999] {
             let key = codec.inode_key(id);
+            let key = key.as_ref();
             assert_eq!(key[ko], u8::from(KeyPrefix::Inode));
             assert_eq!(&key[io..io + 8], &id.to_be_bytes());
         }
@@ -237,6 +238,7 @@ mod tests {
         let io = codec.id_offset(KeyPrefix::Extent);
         for (ino, idx) in [(1u64, 0u64), (42, 10), (999, 999)] {
             let key = codec.extent_key(ino, idx);
+            let key = key.as_ref();
             assert_eq!(key[ko], u8::from(KeyPrefix::Extent));
             assert_eq!(&key[io..io + 8], &ino.to_be_bytes());
             assert_eq!(&key[io + 8..io + 16], &idx.to_be_bytes());

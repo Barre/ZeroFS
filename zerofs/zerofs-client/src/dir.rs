@@ -120,7 +120,7 @@ impl Dir {
             st.buf.extend(
                 entries
                     .iter()
-                    .filter(|e| e.name.data != b"." && e.name.data != b"..")
+                    .filter(|e| e.name.as_ref() != b"." && e.name.as_ref() != b"..")
                     .map(DirEntry::from_plus),
             );
         }

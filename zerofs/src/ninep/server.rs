@@ -2,17 +2,17 @@ use super::errors::P9Error;
 pub(crate) use super::handler::NinePHandler;
 use super::handler::SessionReleaseGuard;
 pub(crate) use super::lock_manager::FileLockManager;
+use super::response::{EncodedResponse, Response};
 use crate::fs::ZeroFS;
 use crate::task::spawn_named;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use ninep_proto::{
-    Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE, P9_MAX_MSIZE,
-    P9_MIN_MESSAGE_SIZE, P9_OP_ENVELOPE_LEN, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN, P9Message, Rlerror,
-    T_WRITE,
+    P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE, P9_MAX_MSIZE, P9_MIN_MESSAGE_SIZE,
+    P9_OP_ENVELOPE_LEN, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN, P9Message,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -20,15 +20,13 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::mpsc;
-#[cfg(test)]
-use tokio::sync::oneshot;
 use tokio_util::codec::LengthDelimitedCodec;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};
 
 /// 9P message type byte for Tflush. Kept here so the reader can recognise a
-/// flush from the raw frame header without deku-parsing the whole body.
+/// flush from the raw frame header without decoding the whole body.
 const TFLUSH_TYPE: u8 = 108;
 /// `Rlerror` is permitted after serving-authority loss.
 const RLERROR_TYPE: u8 = 7;
@@ -301,7 +299,7 @@ impl ResponseAuthority {
 
 fn spawn_response_writer<W>(
     write_stream: W,
-    mut rx: mpsc::Receiver<(u16, Vec<u8>)>,
+    mut rx: mpsc::Receiver<(u16, EncodedResponse)>,
     authority: ResponseAuthority,
     connection_shutdown: CancellationToken,
 ) -> AbortOnDropHandle<()>
@@ -325,9 +323,10 @@ where
             let second = match rx.try_recv() {
                 Ok(more) => more,
                 Err(_) => {
-                    let (tag, response_bytes) = first;
-                    let requires_authority = response_requires_serving_authority(&response_bytes);
-                    if requires_authority && !authority.may_emit(&response_bytes) {
+                    let (tag, mut response_bytes) = first;
+                    let requires_authority =
+                        response_requires_serving_authority(response_bytes.chunk());
+                    if requires_authority && !authority.may_emit(response_bytes.chunk()) {
                         warn!(
                             "Dropping successful 9P response for tag {tag} after serving authority \
                              was lost; closing the connection"
@@ -347,7 +346,7 @@ where
                     // its copy for this latency-critical case, but still flush
                     // the underlying AsyncWrite: write_all only guarantees
                     // acceptance, and the transport itself may be buffered.
-                    if let Err(e) = writer.get_mut().write_all(&response_bytes).await {
+                    if let Err(e) = writer.get_mut().write_all_buf(&mut response_bytes).await {
                         error!("Failed to write response for tag {}: {}", tag, e);
                         return;
                     }
@@ -380,9 +379,10 @@ where
 
             let mut buffered_authority_gated_success = false;
             let mut dropped_authority_gated_success = false;
-            for (tag, response_bytes) in batch {
-                let requires_authority = response_requires_serving_authority(&response_bytes);
-                if requires_authority && !authority.may_emit(&response_bytes) {
+            for (tag, mut response_bytes) in batch {
+                let requires_authority =
+                    response_requires_serving_authority(response_bytes.chunk());
+                if requires_authority && !authority.may_emit(response_bytes.chunk()) {
                     warn!(
                         "Dropping successful 9P response for tag {tag} after serving authority \
                          was lost; closing the connection"
@@ -399,7 +399,7 @@ where
                     return;
                 }
                 buffered_authority_gated_success |= requires_authority;
-                if let Err(e) = writer.write_all(&response_bytes).await {
+                if let Err(e) = writer.write_all_buf(&mut response_bytes).await {
                     error!("Failed to write response for tag {}: {}", tag, e);
                     return;
                 }
@@ -437,7 +437,7 @@ where
 {
     let handler = Arc::new(NinePHandler::new(Arc::clone(&filesystem), lock_manager));
 
-    let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
+    let (tx, rx) = mpsc::channel::<(u16, EncodedResponse)>(P9_CHANNEL_SIZE);
     let connection_shutdown = shutdown.child_token();
     let writer_task = spawn_response_writer(
         write_stream,
@@ -646,8 +646,8 @@ impl Drop for RequestLease {
 
 /// Reserve response capacity, enqueue the terminal response, then retire its tag.
 async fn enqueue_terminal_response(
-    tx: &mpsc::Sender<(u16, Vec<u8>)>,
-    response_bytes: Vec<u8>,
+    tx: &mpsc::Sender<(u16, EncodedResponse)>,
+    response_bytes: EncodedResponse,
     request_lease: &RequestLease,
 ) -> Result<(), mpsc::error::SendError<()>> {
     let permit = tx.reserve().await?;
@@ -739,7 +739,7 @@ fn inspect_frame_metadata(frame: &[u8], zerofs_protocol: bool) -> ShallowFrameMe
 pub(crate) fn dispatch_9p_frame(
     frame: Bytes,
     handler: &Arc<NinePHandler>,
-    tx: &mpsc::Sender<(u16, Vec<u8>)>,
+    tx: &mpsc::Sender<(u16, EncodedResponse)>,
     inflight: &InflightRegistry,
 ) -> anyhow::Result<()> {
     if frame.len() < P9_MIN_MESSAGE_SIZE as usize {
@@ -787,13 +787,8 @@ pub(crate) fn dispatch_9p_frame(
     let tx = tx.clone();
 
     spawn_named("9p-request", async move {
-        // Only Twrite has an inbound bulk payload worth retaining. Other
-        // requests keep the regular decoder and the original error diagnostics.
-        let parsed = if type_byte == T_WRITE {
-            P9Message::from_owned_bytes_ctx(frame.clone(), zerofs_protocol)
-        } else {
-            P9Message::from_bytes_ctx(&frame, zerofs_protocol)
-        };
+        // Strings and bulk payloads share the received frame's allocation.
+        let parsed = P9Message::from_owned_bytes_ctx(frame.clone(), zerofs_protocol);
 
         // Barrier waiters were captured synchronously in receive order.
         for waiter in prior_waiters {
@@ -818,7 +813,7 @@ pub(crate) fn dispatch_9p_frame(
                         received_guard,
                     )
                     .await;
-                response.to_bytes().ok()
+                response.encode().ok()
             }
             Err(e) => {
                 debug!(
@@ -831,14 +826,9 @@ pub(crate) fn dispatch_9p_frame(
                     P9_DEBUG_BUFFER_SIZE,
                     &frame[..std::cmp::min(P9_DEBUG_BUFFER_SIZE, frame.len())]
                 );
-                P9Message::new(
-                    tag,
-                    Message::Rlerror(Rlerror {
-                        ecode: P9Error::NotImplemented.to_errno(),
-                    }),
-                )
-                .to_bytes()
-                .ok()
+                Response::error(tag, P9Error::NotImplemented.to_errno())
+                    .encode()
+                    .ok()
             }
         };
 
@@ -870,7 +860,7 @@ pub(crate) fn dispatch_9p_frame(
 async fn handle_client_loop<R>(
     handler: Arc<NinePHandler>,
     read_stream: R,
-    tx: mpsc::Sender<(u16, Vec<u8>)>,
+    tx: mpsc::Sender<(u16, EncodedResponse)>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()>
 where
@@ -920,18 +910,28 @@ mod tests {
     use crate::fs::permissions::Credentials;
     use crate::ninep::lock_manager::FileLock;
     use ninep_proto::{
-        DekuBytes, GETATTR_ALL, LockType, P9String, Rclunk, Rflush, Rlopenat, Rread, Tattach,
-        Tclunk, Tflush, Tgetattr, Tlopenat, Tmkdir, Tversion, Twrite, VERSION_9P2000L_ZEROFS,
+        GETATTR_ALL, LockType, Message, P9Bytes, P9String, Rclunk, Rflush, Rlerror, Rlopenat,
+        Rread, Tattach, Tclunk, Tflush, Tgetattr, Tlopenat, Tmkdir, Tversion, Twrite,
+        VERSION_9P2000L_ZEROFS,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
+    use tokio::sync::oneshot;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(1);
     const QUIET_TIMEOUT: Duration = Duration::from_millis(20);
 
     fn frame(tag: u16, body: Message) -> Bytes {
         Bytes::from(P9Message::new(tag, body).to_bytes().unwrap())
+    }
+
+    fn flatten(mut bytes: impl Buf) -> Bytes {
+        bytes.copy_to_bytes(bytes.remaining())
+    }
+
+    fn encoded(bytes: Vec<u8>) -> EncodedResponse {
+        Bytes::from(bytes).chain(bytes_utils::SegmentedBuf::new())
     }
 
     fn decode(bytes: &[u8]) -> P9Message {
@@ -988,8 +988,8 @@ mod tests {
 
     struct DispatchFixture {
         handler: Arc<NinePHandler>,
-        tx: mpsc::Sender<(u16, Vec<u8>)>,
-        rx: mpsc::Receiver<(u16, Vec<u8>)>,
+        tx: mpsc::Sender<(u16, EncodedResponse)>,
+        rx: mpsc::Receiver<(u16, EncodedResponse)>,
         inflight: InflightRegistry,
     }
 
@@ -1022,7 +1022,7 @@ mod tests {
                 .await
                 .expect(context)
                 .expect("response channel");
-            (tag, decode(&bytes))
+            (tag, decode(&flatten(bytes)))
         }
 
         async fn recv_flush(&mut self, context: &str) -> u16 {
@@ -1066,10 +1066,10 @@ mod tests {
 
     fn response_queue<const N: usize>(
         responses: [(u16, Vec<u8>); N],
-    ) -> mpsc::Receiver<(u16, Vec<u8>)> {
+    ) -> mpsc::Receiver<(u16, EncodedResponse)> {
         let (tx, rx) = mpsc::channel(N);
         for response in responses {
-            tx.try_send(response).unwrap();
+            tx.try_send((response.0, encoded(response.1))).unwrap();
         }
         rx
     }
@@ -1309,6 +1309,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn segmented_responses_handle_partial_writes() {
+        for batch in [false, true] {
+            // Smaller than the reply header, so the write cannot finish at once.
+            let (mut client, server) = tokio::io::duplex(5);
+            let data = Bytes::from_static(b"hello world");
+            let mut expected = frame(
+                21,
+                Message::Rread(Rread {
+                    count: data.len() as u32,
+                    data: data.clone().into(),
+                }),
+            )
+            .to_vec();
+            let chunks = vec![data.slice(..5), data.slice(5..)].into();
+            let message = P9Message::new(
+                21,
+                Message::Rread(Rread {
+                    count: data.len() as u32,
+                    data: P9Bytes::default(),
+                }),
+            );
+            let (tx, rx) = mpsc::channel(2);
+            tx.try_send((21, Response::new(message, Some(chunks)).encode().unwrap()))
+                .unwrap();
+            let tail = frame(22, Message::Rflush(Rflush));
+            if batch {
+                tx.try_send((22, encoded(tail.to_vec()))).unwrap();
+                expected.extend_from_slice(&tail);
+            }
+            drop(tx);
+            let writer = spawn_response_writer(
+                server,
+                rx,
+                ResponseAuthority::always(),
+                CancellationToken::new(),
+            );
+            let mut received = Vec::new();
+            tokio::time::timeout(TEST_TIMEOUT, client.read_to_end(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            drain_writer(writer, "segmented writer drains").await;
+            assert_eq!(received, expected);
+        }
+    }
+
+    #[tokio::test]
     async fn already_queued_responses_share_one_transport_write() {
         let (mut client, server) = tokio::io::duplex(4096);
         let writes = Arc::new(AtomicUsize::new(0));
@@ -1394,7 +1441,7 @@ mod tests {
             52,
             Message::Rread(Rread {
                 count: 0,
-                data: DekuBytes::from(vec![0; RESPONSE_BUFFER_CAPACITY - 17]),
+                data: P9Bytes::from(vec![0; RESPONSE_BUFFER_CAPACITY - 17]),
             }),
         )
         .to_vec();
@@ -1539,7 +1586,7 @@ mod tests {
             connection_shutdown.clone(),
         );
 
-        tx.send((21, vec![1, 2, 3]))
+        tx.send((21, encoded(vec![1, 2, 3])))
             .await
             .expect("response enqueue");
         tokio::time::timeout(TEST_TIMEOUT, connection_shutdown.cancelled())
@@ -1639,9 +1686,13 @@ mod tests {
         let original_waiter = inflight.waiter(7).expect("original request");
         let response = vec![1, 2, 3];
         let (tx, mut rx) = mpsc::channel(1);
-        tx.send((99, vec![0])).await.unwrap();
+        tx.send((99, encoded(vec![0]))).await.unwrap();
 
-        let mut enqueue = Box::pin(enqueue_terminal_response(&tx, response.clone(), &original));
+        let mut enqueue = Box::pin(enqueue_terminal_response(
+            &tx,
+            encoded(response.clone()),
+            &original,
+        ));
         tokio::select! {
             biased;
             result = &mut enqueue => panic!("full response queue accepted a send: {result:?}"),
@@ -1651,14 +1702,16 @@ mod tests {
             inflight.register(7, FidFootprint::None).is_err(),
             "queue backpressure must keep the tag occupied until capacity is reserved"
         );
-        assert_eq!(rx.recv().await.unwrap(), (99, vec![0]));
+        let (tag, bytes) = rx.recv().await.unwrap();
+        assert_eq!((tag, flatten(bytes).to_vec()), (99, vec![0]));
 
         tokio::time::timeout(TEST_TIMEOUT, &mut enqueue)
             .await
             .expect("response enqueue")
             .unwrap();
         drop(enqueue);
-        assert_eq!(rx.recv().await.unwrap(), (7, response));
+        let (tag, bytes) = rx.recv().await.unwrap();
+        assert_eq!((tag, flatten(bytes).to_vec()), (7, response));
 
         let replacement = inflight
             .register(7, FidFootprint::None)

@@ -1,36 +1,16 @@
-//! Allocation-free codec shared by userspace and the native ZeroFS client.
+//! Allocation-free 9P codec shared by the server, userspace, and kernel clients.
 //!
-//! ZeroFS speaks the private `9P2000.L.Z` dialect. This module implements the
-//! messages used by the native kernel client:
-//! version and lineage negotiation, fid rebinding, compound walk/getattr,
-//! getattr/setattr, open/create, positioned reads and writes, namespace
-//! mutations, symlinks, fallocate, verified fsync, readdir-with-attributes,
-//! clunk, statfs, and byte-range locking.
+//! [`decode_frame`] and [`encode_frame`] support all implemented 9P messages,
+//! including negotiated mutation envelopes. [`Request`],
+//! [`encode_request`], and [`decode_response`] are native-client convenience
+//! APIs over that same codec. Variable fields borrow caller-owned storage.
 //!
-//! The codec has no dependency on `std`, `alloc`, or third-party crates.
-//! Requests are written into a caller-owned fixed buffer and responses borrow
-//! their variable-length fields from a caller-owned frame.  A transport must
-//! keep that frame alive while the decoded response is in use.
-//!
-//! All scalar fields are little-endian.  A frame is:
-//!
-//! ```text
-//! size[4] type[1] tag[2] body[size - 7]
-//! ```
-//!
-//! ZeroFS mutations carry a private envelope immediately after the tag:
-//!
-//! ```text
-//! op_id[16] flags[1] origin_writer_epoch[8]
-//! ```
-//!
-//! Responses and durability barriers do not carry the envelope.
+//! A frame is `size[4] type[1] tag[2] body[size - 7]`, all little-endian.
+//! Negotiated ZeroFS mutations insert `op_id[16] flags[1] origin_writer_epoch[8]`
+//! after the tag. Responses and durability barriers have no envelope.
 
 #![cfg_attr(MODULE, allow(dead_code, unreachable_pub))]
 
-#[cfg(MODULE)]
-#[path = "wire_requests.rs"]
-mod wire_requests;
 #[cfg(MODULE)]
 #[path = "wire_types.rs"]
 mod wire_types;
@@ -39,6 +19,19 @@ mod wire_types;
 pub use crate::wire_types::*;
 #[cfg(MODULE)]
 pub use wire_types::*;
+
+#[cfg(MODULE)]
+#[path = "wire_messages.rs"]
+mod wire_messages;
+#[cfg(not(MODULE))]
+use crate::{wire_messages, wire_types};
+#[path = "slice_messages.rs"]
+mod messages;
+#[cfg_attr(MODULE, allow(unused_imports))]
+pub use messages::{
+    DirectoryEntry, Frame, LockType, Message, Names, QidList, carries_op_id, decode_entry,
+    decode_frame, encode_entry, encode_frame, encoded_frame_size,
+};
 
 pub const MAX_MSIZE: u32 = P9_MAX_MSIZE;
 
@@ -207,6 +200,20 @@ pub enum CodecError {
     UnexpectedMessageType(u8),
     /// A decoded fixed-layout response has extra bytes.
     TrailingData,
+    /// A lock type is outside the three values defined by 9P.
+    InvalidLockType,
+}
+
+impl core::fmt::Display for CodecError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "9P codec error: {self:?}")
+    }
+}
+impl core::error::Error for CodecError {}
+impl From<core::num::TryFromIntError> for CodecError {
+    fn from(_: core::num::TryFromIntError) -> Self {
+        Self::LengthOverflow
+    }
 }
 
 /// Largest data payload an enveloped `Twrite` can carry within `msize`.
@@ -378,170 +385,313 @@ pub enum Request<'a> {
     },
 }
 
-// Request encoding, type IDs, tag rules, and size arithmetic come from
-// `wire_requests.rs`. The borrowed enum and owned codec declare their fields
-// separately, so cross-codec tests keep their representations aligned.
-
-macro_rules! put_request_field {
-    ($writer:expr, $value:expr, u8) => {
-        $writer.put_u8($value)?
-    };
-    ($writer:expr, $value:expr, u16) => {
-        $writer.put_u16($value)?
-    };
-    ($writer:expr, $value:expr, u32) => {
-        $writer.put_u32($value)?
-    };
-    ($writer:expr, $value:expr, u64) => {
-        $writer.put_u64($value)?
-    };
-    ($writer:expr, $value:expr, str) => {
-        $writer.put_string($value)?
-    };
-    ($writer:expr, $value:expr, envelope) => {
-        put_mutation_envelope(&mut $writer, $value)?
-    };
-    ($writer:expr, $value:expr, names) => {{
-        if $value.len() > u16::MAX as usize {
-            return Err(CodecError::TooManyNames);
-        }
-        $writer.put_u16($value.len() as u16)?;
-        for name in $value {
-            $writer.put_string(name)?;
-        }
-    }};
-    ($writer:expr, $value:expr, payload) => {{
-        if $value.len() > u32::MAX as usize {
-            return Err(CodecError::MessageTooLarge);
-        }
-        $writer.put_u32($value.len() as u32)?;
-        $writer.put($value)?
-    }};
+impl Request<'_> {
+    fn as_message(&self) -> Result<(Message<'_>, MutationEnvelope), CodecError> {
+        Ok(match *self {
+            Self::Tversion { msize, version } => (
+                Message::Tversion { msize, version },
+                MutationEnvelope::default(),
+            ),
+            Self::Tgetlineage => (Message::Tgetlineage {}, MutationEnvelope::default()),
+            Self::Trebind {
+                fid,
+                inode_id,
+                root_inode,
+                flags,
+                uname,
+                n_uname,
+            } => (
+                Message::Trebind {
+                    fid,
+                    inode_id,
+                    root_inode,
+                    flags,
+                    uname,
+                    n_uname,
+                },
+                MutationEnvelope::default(),
+            ),
+            Self::Twalkgetattr { fid, newfid, names } => (
+                Message::Twalkgetattr {
+                    fid,
+                    newfid,
+                    nwname: names
+                        .len()
+                        .try_into()
+                        .map_err(|_| CodecError::TooManyNames)?,
+                    wnames: Names::Slices(names),
+                },
+                MutationEnvelope::default(),
+            ),
+            Self::Tgetattr { fid, request_mask } => (
+                Message::Tgetattr { fid, request_mask },
+                MutationEnvelope::default(),
+            ),
+            Self::Tsetattrattr {
+                envelope,
+                fid,
+                valid,
+                mode,
+                uid,
+                gid,
+                size,
+                atime_sec,
+                atime_nsec,
+                mtime_sec,
+                mtime_nsec,
+            } => (
+                Message::Tsetattrattr {
+                    fid,
+                    valid,
+                    mode,
+                    uid,
+                    gid,
+                    size,
+                    atime_sec,
+                    atime_nsec,
+                    mtime_sec,
+                    mtime_nsec,
+                },
+                envelope,
+            ),
+            Self::Tfallocate {
+                envelope,
+                fid,
+                offset,
+                length,
+                mode,
+            } => (
+                Message::Tfallocate {
+                    fid,
+                    offset,
+                    length,
+                    mode,
+                },
+                envelope,
+            ),
+            Self::Tlopenat { fid, newfid, flags } => (
+                Message::Tlopenat { fid, newfid, flags },
+                MutationEnvelope::default(),
+            ),
+            Self::Tlopenatread {
+                fid,
+                newfid,
+                flags,
+                count,
+            } => (
+                Message::Tlopenatread {
+                    fid,
+                    newfid,
+                    flags,
+                    count,
+                },
+                MutationEnvelope::default(),
+            ),
+            Self::Tlcreateattr {
+                envelope,
+                dfid,
+                newfid,
+                name,
+                flags,
+                mode,
+                gid,
+            } => (
+                Message::Tlcreateattr {
+                    dfid,
+                    newfid,
+                    name,
+                    flags,
+                    mode,
+                    gid,
+                },
+                envelope,
+            ),
+            Self::Tmkdirattr {
+                envelope,
+                dfid,
+                name,
+                mode,
+                gid,
+            } => (
+                Message::Tmkdirattr {
+                    dfid,
+                    name,
+                    mode,
+                    gid,
+                },
+                envelope,
+            ),
+            Self::Tsymlinkattr {
+                envelope,
+                dfid,
+                name,
+                target,
+                gid,
+            } => (
+                Message::Tsymlinkattr {
+                    dfid,
+                    name,
+                    symtgt: target,
+                    gid,
+                },
+                envelope,
+            ),
+            Self::Tmknodattr {
+                envelope,
+                dfid,
+                name,
+                mode,
+                major,
+                minor,
+                gid,
+            } => (
+                Message::Tmknodattr {
+                    dfid,
+                    name,
+                    mode,
+                    major,
+                    minor,
+                    gid,
+                },
+                envelope,
+            ),
+            Self::Tlinkattr {
+                envelope,
+                dfid,
+                fid,
+                name,
+            } => (Message::Tlinkattr { dfid, fid, name }, envelope),
+            Self::Trenameat {
+                envelope,
+                olddirfid,
+                oldname,
+                newdirfid,
+                newname,
+            } => (
+                Message::Trenameat {
+                    olddirfid,
+                    oldname,
+                    newdirfid,
+                    newname,
+                },
+                envelope,
+            ),
+            Self::Tunlinkat {
+                envelope,
+                dirfid,
+                name,
+                flags,
+            } => (
+                Message::Tunlinkat {
+                    dirfid,
+                    name,
+                    flags,
+                },
+                envelope,
+            ),
+            Self::Treadlink { fid } => (Message::Treadlink { fid }, MutationEnvelope::default()),
+            Self::Tflush { oldtag } => (Message::Tflush { oldtag }, MutationEnvelope::default()),
+            Self::Tread { fid, offset, count } => (
+                Message::Tread { fid, offset, count },
+                MutationEnvelope::default(),
+            ),
+            Self::Twrite {
+                envelope,
+                fid,
+                offset,
+                data,
+            } => (
+                Message::Twrite {
+                    fid,
+                    offset,
+                    count: data
+                        .len()
+                        .try_into()
+                        .map_err(|_| CodecError::MessageTooLarge)?,
+                    data,
+                },
+                envelope,
+            ),
+            Self::Tfsyncdur {
+                fid,
+                datasync,
+                token,
+            } => (
+                Message::Tfsyncdur {
+                    fid,
+                    datasync,
+                    token,
+                },
+                MutationEnvelope::default(),
+            ),
+            Self::Treaddirattr { fid, offset, count } => (
+                Message::Treaddirattr { fid, offset, count },
+                MutationEnvelope::default(),
+            ),
+            Self::Tclunk { fid } => (Message::Tclunk { fid }, MutationEnvelope::default()),
+            Self::Tstatfs { fid } => (Message::Tstatfs { fid }, MutationEnvelope::default()),
+            Self::Tlock {
+                fid,
+                lock_type,
+                flags,
+                start,
+                length,
+                proc_id,
+                client_id,
+            } => (
+                Message::Tlock {
+                    fid,
+                    lock_type: lock_type.try_into()?,
+                    flags,
+                    start,
+                    length,
+                    proc_id,
+                    client_id,
+                },
+                MutationEnvelope::default(),
+            ),
+            Self::Tgetlock {
+                fid,
+                lock_type,
+                start,
+                length,
+                proc_id,
+                client_id,
+            } => (
+                Message::Tgetlock {
+                    fid,
+                    lock_type: lock_type.try_into()?,
+                    start,
+                    length,
+                    proc_id,
+                    client_id,
+                },
+                MutationEnvelope::default(),
+            ),
+        })
+    }
+    fn tag_is_valid(&self, tag: u16) -> bool {
+        matches!(self, Self::Tversion { .. }) == (tag == NOTAG)
+    }
 }
-
-macro_rules! request_field_size {
-    // Fixed-width fields contribute their width whatever they hold, but still
-    // consume the binding so the expansion has no unused pattern variables.
-    ($value:expr, u8) => {{
-        let _ = $value;
-        1
-    }};
-    ($value:expr, u16) => {{
-        let _ = $value;
-        2
-    }};
-    ($value:expr, u32) => {{
-        let _ = $value;
-        4
-    }};
-    ($value:expr, u64) => {{
-        let _ = $value;
-        8
-    }};
-    ($value:expr, envelope) => {{
-        let _ = $value;
-        OP_ENVELOPE_SIZE
-    }};
-    ($value:expr, str) => {
-        string_size($value)?
-    };
-    ($value:expr, names) => {{
-        if $value.len() > u16::MAX as usize {
-            return Err(CodecError::TooManyNames);
-        }
-        let mut total = 2usize;
-        for name in *$value {
-            total = total
-                .checked_add(string_size(name)?)
-                .ok_or(CodecError::LengthOverflow)?;
-        }
-        total
-    }};
-    ($value:expr, payload) => {{
-        if $value.len() > u32::MAX as usize {
-            return Err(CodecError::MessageTooLarge);
-        }
-        checked_sum(&[4, $value.len()])?
-    }};
+/// Encode a native-client request using the canonical frame codec.
+pub fn encode_request(
+    output: &mut [u8],
+    max_msize: u32,
+    tag: u16,
+    request: Request<'_>,
+) -> Result<usize, CodecError> {
+    if !request.tag_is_valid(tag) {
+        return Err(CodecError::InvalidTag);
+    }
+    let (body, envelope) = request.as_message()?;
+    encode_frame(output, max_msize, tag, envelope, &body, true)
 }
-
-macro_rules! emit_request_codec {
-    ($($variant:ident, $id:ident, $tag:ident, { $($field:ident : $kind:tt),* $(,)? });* $(;)?) => {
-        impl Request<'_> {
-            fn type_id(&self) -> u8 {
-                match self {
-                    $(Request::$variant { .. } => message_type::$id,)*
-                }
-            }
-
-            fn tag_is_valid(&self, tag: u16) -> bool {
-                match self {
-                    $(Request::$variant { .. } => emit_request_codec!(@tag $tag, tag),)*
-                }
-            }
-        }
-
-        /// Encode one request into `output`, returning its length in bytes.
-        ///
-        /// `max_msize` is the requested size for `Tversion` and the negotiated
-        /// size afterward. Requests larger than it are rejected. On success,
-        /// the encoded prefix is one complete frame and the rest of `output`
-        /// remains untouched.
-        pub fn encode_request(
-            output: &mut [u8],
-            max_msize: u32,
-            tag: u16,
-            request: Request<'_>,
-        ) -> Result<usize, CodecError> {
-            if !request.tag_is_valid(tag) {
-                return Err(CodecError::InvalidTag);
-            }
-
-            let type_id = request.type_id();
-            let mut writer = Writer::new(output);
-            writer.put_u32(0)?;
-            writer.put_u8(type_id)?;
-            writer.put_u16(tag)?;
-
-            match request {
-                $(Request::$variant { $($field),* } => {
-                    $(put_request_field!(writer, $field, $kind);)*
-                })*
-            }
-
-            writer.finish(max_msize)
-        }
-
-        /// Bytes `encode_request` will write for this request, header included.
-        pub fn encoded_request_size(request: &Request<'_>) -> Result<usize, CodecError> {
-            let body_size = match request {
-                $(Request::$variant { $($field),* } => {
-                    let total = 0usize;
-                    $(let total = total
-                        .checked_add(request_field_size!($field, $kind))
-                        .ok_or(CodecError::LengthOverflow)?;)*
-                    total
-                })*
-            };
-            body_size
-                .checked_add(HEADER_SIZE)
-                .ok_or(CodecError::LengthOverflow)
-        }
-    };
-    (@tag notag, $tag:ident) => {
-        $tag == NOTAG
-    };
-    (@tag tag, $tag:ident) => {
-        $tag != NOTAG
-    };
+/// Exact bytes needed for a native-client request, including its envelope.
+pub fn encoded_request_size(request: &Request<'_>) -> Result<usize, CodecError> {
+    let (body, _) = request.as_message()?;
+    encoded_frame_size(&body, true)
 }
-
-#[cfg(MODULE)]
-use self::wire_requests::for_each_request;
-#[cfg(not(MODULE))]
-use crate::wire_requests::for_each_request;
-
-for_each_request!(emit_request_codec);
 
 /// Encode the fixed portion of an enveloped `Twrite`.
 ///
@@ -765,219 +915,117 @@ pub fn decode_response<'a>(
     max_msize: u32,
     expected_tag: u16,
 ) -> Result<DecodedResponse<'a>, CodecError> {
-    let declared_size = decode_frame_size(frame, max_msize)?;
-    if declared_size != frame.len() {
+    let header = decode_header(frame, max_msize)?;
+    if header.size as usize != frame.len() {
         return Err(CodecError::FrameSizeMismatch);
     }
-
-    let mut reader = Reader::new(frame);
-    let size = reader.get_u32()?;
-    let type_ = reader.get_u8()?;
-    let tag = reader.get_u16()?;
-    if tag != expected_tag {
+    if header.tag != expected_tag {
         return Err(CodecError::TagMismatch {
             expected: expected_tag,
-            actual: tag,
+            actual: header.tag,
         });
     }
-
-    let body = match type_ {
-        message_type::RVERSION => {
-            let msize = reader.get_u32()?;
-            let version = reader.get_string()?;
-            reader.require_end()?;
-            Response::Rversion(Rversion {
-                msize,
-                version: WireString::from_storage(version),
-            })
-        }
-        message_type::RGETLINEAGE => {
-            let token = reader.get_u64()?;
-            let writer_epoch = reader.get_u64()?;
-            reader.require_end()?;
-            Response::Rgetlineage(Rgetlineage {
-                token,
-                writer_epoch,
-            })
-        }
-        message_type::RREBIND => {
-            let qid = decode_qid(&mut reader)?;
-            reader.require_end()?;
-            Response::Rrebind(Rrebind { qid })
-        }
-        message_type::RWALKGETATTR => {
-            let count = reader.get_u16()?;
-            let qid_bytes_len = (count as usize)
-                .checked_mul(QID_WIRE_SIZE)
-                .ok_or(CodecError::LengthOverflow)?;
-            let qid_bytes = reader.take(qid_bytes_len)?;
-            let stat = decode_stat(&mut reader)?;
-            reader.require_end()?;
-            Response::Rwalkgetattr(Rwalkgetattr {
-                qids: Qids {
-                    bytes: qid_bytes,
-                    count,
-                },
-                stat,
-            })
-        }
-        message_type::RGETATTR => {
-            let valid = reader.get_u64()?;
-            let stat = decode_stat(&mut reader)?;
-            reader.require_end()?;
-            Response::Rgetattr(Rgetattr { valid, stat })
-        }
-        message_type::RSETATTRATTR => {
-            let stat = decode_stat(&mut reader)?;
-            reader.require_end()?;
-            Response::Rsetattrattr(stat)
-        }
-        message_type::RFALLOCATE => {
-            reader.require_end()?;
-            Response::Rfallocate
-        }
-        message_type::RLOPEN | message_type::RLOPENAT => {
-            let qid = decode_qid(&mut reader)?;
-            let iounit = reader.get_u32()?;
-            reader.require_end()?;
-            let open = Rlopen { qid, iounit };
-            if type_ == message_type::RLOPEN {
-                Response::Rlopen(open)
-            } else {
-                Response::Rlopenat(open)
-            }
-        }
-        message_type::RLOPENATREAD => {
-            let qid = decode_qid(&mut reader)?;
-            let iounit = reader.get_u32()?;
-            let eof = reader.get_u8()?;
-            let count = reader.get_u32()? as usize;
-            let data = reader.take(count)?;
-            reader.require_end()?;
-            Response::Rlopenatread(Rlopenatread {
-                qid,
-                iounit,
-                eof,
-                data: WireBytes::from(data),
-            })
-        }
-        message_type::RLCREATEATTR => {
-            let iounit = reader.get_u32()?;
-            let stat = decode_stat(&mut reader)?;
-            reader.require_end()?;
+    let frame = decode_frame(frame, max_msize, false)?;
+    let body = match frame.body {
+        Message::Rgetlineage {
+            token,
+            writer_epoch,
+        } => Response::Rgetlineage(Rgetlineage {
+            token,
+            writer_epoch,
+        }),
+        Message::Rrebind { qid } => Response::Rrebind(Rrebind { qid }),
+        Message::Rgetattr { valid, stat } => Response::Rgetattr(Rgetattr { valid, stat }),
+        Message::Rlcreateattr { iounit, stat } => {
             Response::Rlcreateattr(Rlcreateattr { iounit, stat })
         }
-        message_type::RMKDIRATTR => {
-            let stat = decode_stat(&mut reader)?;
-            reader.require_end()?;
-            Response::Rmkdirattr(stat)
-        }
-        message_type::RSYMLINKATTR => {
-            let stat = decode_stat(&mut reader)?;
-            reader.require_end()?;
-            Response::Rsymlinkattr(stat)
-        }
-        message_type::RMKNODATTR => {
-            let stat = decode_stat(&mut reader)?;
-            reader.require_end()?;
-            Response::Rmknodattr(stat)
-        }
-        message_type::RLINKATTR => {
-            let stat = decode_stat(&mut reader)?;
-            reader.require_end()?;
-            Response::Rlinkattr(stat)
-        }
-        message_type::RRENAMEAT => {
-            reader.require_end()?;
-            Response::Rrenameat
-        }
-        message_type::RUNLINKAT => {
-            reader.require_end()?;
-            Response::Runlinkat
-        }
-        message_type::RREADLINK => {
-            let target = reader.get_string()?;
-            reader.require_end()?;
-            Response::Rreadlink(Rreadlink {
-                target: WireString::from_storage(target),
-            })
-        }
-        message_type::RFLUSH => {
-            reader.require_end()?;
-            Response::Rflush
-        }
-        message_type::RREAD => {
-            let count = reader.get_u32()? as usize;
-            let data = reader.take(count)?;
-            reader.require_end()?;
-            Response::Rread(Rread {
-                data: WireBytes::from(data),
-            })
-        }
-        message_type::RWRITE => {
-            let count = reader.get_u32()?;
-            reader.require_end()?;
-            Response::Rwrite(Rwrite { count })
-        }
-        message_type::RFSYNC => {
-            reader.require_end()?;
-            Response::Rfsync
-        }
-        message_type::RREADDIRATTR => {
-            let count = reader.get_u32()? as usize;
-            let data = reader.take(count)?;
-            reader.require_end()?;
+        Message::Rwrite { count } => Response::Rwrite(Rwrite { count }),
+        Message::Rstatfs {
+            r#type,
+            bsize,
+            blocks,
+            bfree,
+            bavail,
+            files,
+            ffree,
+            fsid,
+            namelen,
+        } => Response::Rstatfs(Rstatfs {
+            r#type,
+            bsize,
+            blocks,
+            bfree,
+            bavail,
+            files,
+            ffree,
+            fsid,
+            namelen,
+        }),
+        Message::Rlock { status } => Response::Rlock(Rlock { status }),
+        Message::Rlerror { ecode } => Response::Rlerror(Rlerror { ecode }),
+        Message::Rsetattrattr { stat } => Response::Rsetattrattr(stat),
+        Message::Rmkdirattr { stat } => Response::Rmkdirattr(stat),
+        Message::Rsymlinkattr { stat } => Response::Rsymlinkattr(stat),
+        Message::Rmknodattr { stat } => Response::Rmknodattr(stat),
+        Message::Rlinkattr { stat } => Response::Rlinkattr(stat),
+        Message::Rfallocate {} => Response::Rfallocate,
+        Message::Rrenameat {} => Response::Rrenameat,
+        Message::Runlinkat {} => Response::Runlinkat,
+        Message::Rflush {} => Response::Rflush,
+        Message::Rfsync {} => Response::Rfsync,
+        Message::Rclunk {} => Response::Rclunk,
+        Message::Rlopen { qid, iounit } => Response::Rlopen(Rlopen { qid, iounit }),
+        Message::Rlopenat { qid, iounit } => Response::Rlopenat(Rlopen { qid, iounit }),
+        Message::Rversion { msize, version } => Response::Rversion(Rversion {
+            msize,
+            version: WireString::from_storage(version),
+        }),
+        Message::Rwalkgetattr {
+            wqids: QidList::Encoded(bytes),
+            nwqid: count,
+            stat,
+        } => Response::Rwalkgetattr(Rwalkgetattr {
+            qids: Qids { bytes, count },
+            stat,
+        }),
+        Message::Rreadlink { target } => Response::Rreadlink(Rreadlink {
+            target: WireString::from_storage(target),
+        }),
+        Message::Rread { data, .. } => Response::Rread(Rread {
+            data: WireBytes::from(data),
+        }),
+        Message::Rlopenatread {
+            qid,
+            iounit,
+            eof,
+            data,
+            ..
+        } => Response::Rlopenatread(Rlopenatread {
+            qid,
+            iounit,
+            eof,
+            data: WireBytes::from(data),
+        }),
+        Message::Rreaddirattr { data, .. } => {
             Response::Rreaddirattr(decode_readdirattr_payload(data)?)
         }
-        message_type::RCLUNK => {
-            reader.require_end()?;
-            Response::Rclunk
-        }
-        message_type::RSTATFS => {
-            let response = Rstatfs {
-                r#type: reader.get_u32()?,
-                bsize: reader.get_u32()?,
-                blocks: reader.get_u64()?,
-                bfree: reader.get_u64()?,
-                bavail: reader.get_u64()?,
-                files: reader.get_u64()?,
-                ffree: reader.get_u64()?,
-                fsid: reader.get_u64()?,
-                namelen: reader.get_u32()?,
-            };
-            reader.require_end()?;
-            Response::Rstatfs(response)
-        }
-        message_type::RLOCK => {
-            let status = reader.get_u8()?;
-            reader.require_end()?;
-            Response::Rlock(Rlock { status })
-        }
-        message_type::RGETLOCK => {
-            let lock_type = reader.get_u8()?;
-            let start = reader.get_u64()?;
-            let length = reader.get_u64()?;
-            let proc_id = reader.get_u32()?;
-            let client_id = reader.get_string()?;
-            reader.require_end()?;
-            Response::Rgetlock(Rgetlock {
-                lock_type,
-                start,
-                length,
-                proc_id,
-                client_id: WireString::from_storage(client_id),
-            })
-        }
-        message_type::RLERROR => {
-            let ecode = reader.get_u32()?;
-            reader.require_end()?;
-            Response::Rlerror(Rlerror { ecode })
-        }
-        other => return Err(CodecError::UnexpectedMessageType(other)),
+        Message::Rgetlock {
+            lock_type,
+            start,
+            length,
+            proc_id,
+            client_id,
+        } => Response::Rgetlock(Rgetlock {
+            lock_type: lock_type as u8,
+            start,
+            length,
+            proc_id,
+            client_id: WireString::from_storage(client_id),
+        }),
+        other => return Err(CodecError::UnexpectedMessageType(other.type_id())),
     };
-
     Ok(DecodedResponse {
-        header: Header { size, type_, tag },
+        header: frame.header,
         body,
     })
 }
@@ -1104,56 +1152,20 @@ fn string_size(value: &[u8]) -> Result<usize, CodecError> {
         .ok_or(CodecError::LengthOverflow)
 }
 
-fn checked_sum(values: &[usize]) -> Result<usize, CodecError> {
-    let mut total = 0usize;
-    for value in values {
-        total = total
-            .checked_add(*value)
-            .ok_or(CodecError::LengthOverflow)?;
-    }
-    Ok(total)
-}
-
 fn decode_dir_entry_plus<'a>(reader: &mut Reader<'a>) -> Result<DirEntryPlus<'a>, CodecError> {
+    let (entry, length) = decode_entry(&reader.input[reader.position..], true)?;
+    reader.take(length)?;
     Ok(DirEntryPlus {
-        qid: decode_qid(reader)?,
-        offset: reader.get_u64()?,
-        type_: reader.get_u8()?,
-        name: reader.get_string()?,
-        stat: decode_stat(reader)?,
+        qid: entry.qid,
+        offset: entry.offset,
+        type_: entry.type_,
+        name: entry.name,
+        stat: entry.stat.ok_or(CodecError::Truncated)?,
     })
 }
 
 fn decode_qid(reader: &mut Reader<'_>) -> Result<Qid, CodecError> {
-    Ok(Qid {
-        type_: reader.get_u8()?,
-        version: reader.get_u32()?,
-        path: reader.get_u64()?,
-    })
-}
-
-fn decode_stat(reader: &mut Reader<'_>) -> Result<Stat, CodecError> {
-    Ok(Stat {
-        qid: decode_qid(reader)?,
-        mode: reader.get_u32()?,
-        uid: reader.get_u32()?,
-        gid: reader.get_u32()?,
-        nlink: reader.get_u64()?,
-        rdev: reader.get_u64()?,
-        size: reader.get_u64()?,
-        blksize: reader.get_u64()?,
-        blocks: reader.get_u64()?,
-        atime_sec: reader.get_u64()?,
-        atime_nsec: reader.get_u64()?,
-        mtime_sec: reader.get_u64()?,
-        mtime_nsec: reader.get_u64()?,
-        ctime_sec: reader.get_u64()?,
-        ctime_nsec: reader.get_u64()?,
-        btime_sec: reader.get_u64()?,
-        btime_nsec: reader.get_u64()?,
-        r#gen: reader.get_u64()?,
-        data_version: reader.get_u64()?,
-    })
+    <Qid as messages::Fixed>::read(reader)
 }
 
 struct Writer<'a> {
@@ -1205,16 +1217,6 @@ impl<'a> Writer<'a> {
         }
         self.put_u16(value.len() as u16)?;
         self.put(value)
-    }
-
-    fn finish(self, max_msize: u32) -> Result<usize, CodecError> {
-        if self.position > u32::MAX as usize || self.position > max_msize as usize {
-            return Err(CodecError::MessageTooLarge);
-        }
-        let size = (self.position as u32).to_le_bytes();
-        let size_field = self.output.get_mut(..4).ok_or(CodecError::BufferTooSmall)?;
-        size_field.copy_from_slice(&size);
-        Ok(self.position)
     }
 }
 
@@ -1363,282 +1365,23 @@ mod tests {
         );
     }
 
-    /// Every request, with values chosen so each field kind is exercised.
-    #[cfg(all(not(MODULE), feature = "owned"))]
-    fn request_corpus() -> [(u16, Request<'static>); 26] {
-        const ENVELOPE: MutationEnvelope = MutationEnvelope {
-            op_id: [
-                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-                0x0e, 0x0f,
-            ],
-            flags: OP_FLAG_RETRY,
-            origin_writer_epoch: 0x0807_0605_0403_0201,
-        };
-        const NAMES: &[&[u8]] = &[b"a", b"bb", b"ccc"];
-
-        [
-            (
-                NOTAG,
-                Request::Tversion {
-                    msize: 0x0011_2233,
-                    version: VERSION_9P2000L_ZEROFS,
-                },
-            ),
-            (1, Request::Tgetlineage),
-            (
-                2,
-                Request::Trebind {
-                    fid: 0x1122_3344,
-                    inode_id: 0x0102_0304_0506_0708,
-                    root_inode: 0x1112_1314_1516_1718,
-                    flags: REBIND_REPLAY | REBIND_OPENED,
-                    uname: b"someone",
-                    n_uname: 1000,
-                },
-            ),
-            (
-                3,
-                Request::Twalkgetattr {
-                    fid: 7,
-                    newfid: 9,
-                    names: NAMES,
-                },
-            ),
-            (
-                4,
-                Request::Tgetattr {
-                    fid: 11,
-                    request_mask: GETATTR_ALL,
-                },
-            ),
-            (
-                5,
-                Request::Tsetattrattr {
-                    envelope: ENVELOPE,
-                    fid: 13,
-                    valid: SETATTR_MODE | SETATTR_CTIME,
-                    mode: 0o644,
-                    uid: 1000,
-                    gid: 1000,
-                    size: 4096,
-                    atime_sec: 1,
-                    atime_nsec: 2,
-                    mtime_sec: 3,
-                    mtime_nsec: 4,
-                },
-            ),
-            (
-                6,
-                Request::Tfallocate {
-                    envelope: ENVELOPE,
-                    fid: 17,
-                    offset: 8192,
-                    length: 4096,
-                    mode: FALLOC_FL_ZERO_RANGE,
-                },
-            ),
-            (
-                7,
-                Request::Tlopenat {
-                    fid: 19,
-                    newfid: 23,
-                    flags: 0o2,
-                },
-            ),
-            (
-                8,
-                Request::Tlcreateattr {
-                    envelope: ENVELOPE,
-                    dfid: 29,
-                    newfid: 31,
-                    name: b"created",
-                    flags: 0o101,
-                    mode: 0o600,
-                    gid: 1000,
-                },
-            ),
-            (
-                9,
-                Request::Tmkdirattr {
-                    envelope: ENVELOPE,
-                    dfid: 37,
-                    name: b"dir",
-                    mode: 0o755,
-                    gid: 1000,
-                },
-            ),
-            (
-                10,
-                Request::Tsymlinkattr {
-                    envelope: ENVELOPE,
-                    dfid: 41,
-                    name: b"link",
-                    target: b"../target",
-                    gid: 1000,
-                },
-            ),
-            (
-                11,
-                Request::Tmknodattr {
-                    envelope: ENVELOPE,
-                    dfid: 43,
-                    name: b"node",
-                    mode: 0o020_600,
-                    major: 4,
-                    minor: 65,
-                    gid: 1000,
-                },
-            ),
-            (
-                12,
-                Request::Tlinkattr {
-                    envelope: ENVELOPE,
-                    dfid: 47,
-                    fid: 53,
-                    name: b"hardlink",
-                },
-            ),
-            (
-                13,
-                Request::Trenameat {
-                    envelope: ENVELOPE,
-                    olddirfid: 59,
-                    oldname: b"from",
-                    newdirfid: 61,
-                    newname: b"to",
-                },
-            ),
-            (
-                14,
-                Request::Tunlinkat {
-                    envelope: ENVELOPE,
-                    dirfid: 67,
-                    name: b"victim",
-                    flags: AT_REMOVEDIR,
-                },
-            ),
-            (15, Request::Treadlink { fid: 71 }),
-            (16, Request::Tflush { oldtag: 0x1234 }),
-            (
-                17,
-                Request::Tread {
-                    fid: 73,
-                    offset: 0x0102_0304_0506_0708,
-                    count: 4096,
-                },
-            ),
-            (
-                18,
-                Request::Twrite {
-                    envelope: ENVELOPE,
-                    fid: 79,
-                    offset: 0x1122_3344_5566_7788,
-                    data: b"payload bytes",
-                },
-            ),
-            (
-                19,
-                Request::Tfsyncdur {
-                    fid: 83,
-                    datasync: 1,
-                    token: 0xdead_beef,
-                },
-            ),
-            (
-                20,
-                Request::Treaddirattr {
-                    fid: 89,
-                    offset: 42,
-                    count: 8192,
-                },
-            ),
-            (21, Request::Tclunk { fid: 97 }),
-            (22, Request::Tstatfs { fid: 101 }),
-            (
-                23,
-                Request::Tlock {
-                    fid: 103,
-                    lock_type: LOCK_TYPE_WRLCK,
-                    flags: LOCK_FLAGS_BLOCK,
-                    start: 1024,
-                    length: 2048,
-                    proc_id: 4242,
-                    client_id: b"client",
-                },
-            ),
-            (
-                24,
-                Request::Tgetlock {
-                    fid: 107,
-                    lock_type: LOCK_TYPE_RDLCK,
-                    start: 0,
-                    length: 0,
-                    proc_id: 4243,
-                    client_id: b"probe",
-                },
-            ),
-            (
-                25,
-                Request::Tlopenatread {
-                    fid: 109,
-                    newfid: 113,
-                    flags: 0,
-                    count: 4096,
-                },
-            ),
-        ]
-    }
-
-    /// Every request this codec encodes must decode in the owned Deku codec and
-    /// re-encode to exactly the same bytes.
-    ///
-    /// The codecs are independent implementations; comparing complete frames
-    /// catches differences despite their distinct field names and in-memory
-    /// representations.
-    #[cfg(all(not(MODULE), feature = "owned"))]
     #[test]
-    fn every_request_round_trips_through_the_owned_codec() {
-        use crate::protocol::P9Message;
-
-        macro_rules! carries_envelope {
-            ($($variant:ident, $id:ident, $tag:ident, { $($field:ident : $kind:tt),* $(,)? });* $(;)?) => {
-                fn carries_envelope(request: &Request<'_>) -> bool {
-                    match request {
-                        $(Request::$variant { .. } => has_envelope!($($kind),*),)*
-                    }
-                }
-            };
-        }
-        macro_rules! has_envelope {
-            () => { false };
-            (envelope $(, $rest:tt)*) => { true };
-            ($first:tt $(, $rest:tt)*) => { has_envelope!($($rest),*) };
-        }
-
-        for_each_request!(carries_envelope);
-
-        for (tag, request) in request_corpus() {
-            let mut frame = [0u8; 512];
-            let length = encode_request(&mut frame, TEST_MSIZE, tag, request).unwrap();
-            let frame = &frame[..length];
-            let op_id_enabled = carries_envelope(&request);
-
-            let decoded = P9Message::from_bytes_ctx(frame, op_id_enabled)
-                .expect("the owned codec must decode what this codec encodes");
-            assert_eq!(decoded.type_, request.type_id(), "message type");
-            assert_eq!(decoded.tag, tag, "tag");
-            assert_eq!(decoded.size as usize, frame.len(), "declared size");
-
-            let reencoded = decoded
-                .to_bytes_ctx(op_id_enabled)
-                .expect("a decoded message must re-encode");
-            assert_eq!(
-                reencoded,
-                frame,
-                "the two codecs disagree on the layout of type {}",
-                request.type_id()
-            );
-        }
+    fn malformed_borrowed_lists_cannot_be_encoded() {
+        let walk = Message::Twalk {
+            fid: 0,
+            newfid: 1,
+            nwname: 1,
+            wnames: Names::Encoded {
+                bytes: &[1, 0, b'a', b'b'],
+                count: 1,
+            },
+        };
+        assert_eq!(walk.body_size(), Err(CodecError::TrailingData));
+        let walk = Message::Rwalk {
+            nwqid: 1,
+            wqids: QidList::Encoded(&[0; 14]),
+        };
+        assert_eq!(walk.body_size(), Err(CodecError::Truncated));
     }
 
     #[test]
@@ -2278,7 +2021,7 @@ mod tests {
 
     #[test]
     fn lock_requests_match_the_9p_layout() {
-        // These values are also spelled as Deku literals in the owned codec,
+        // These values also appear in the canonical message schema,
         // so pin them: a silent divergence would be a protocol split.
         assert_eq!(
             [LOCK_TYPE_RDLCK, LOCK_TYPE_WRLCK, LOCK_TYPE_UNLCK],

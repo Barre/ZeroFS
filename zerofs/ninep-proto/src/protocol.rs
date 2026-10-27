@@ -1,12 +1,9 @@
-use crate::deku_bytes::DekuBytes;
+use crate::slice_codec::{self, CodecError, LockType};
 use crate::wire_types::*;
 use alloc::vec::Vec;
 use bytes::{Buf, Bytes};
-use deku::ctx::{Endian, Order};
-use deku::no_std_io::Cursor;
-use deku::prelude::*;
-use deku::reader::Reader;
-use deku::writer::Writer;
+#[path = "owned_codec.rs"]
+mod owned_codec;
 
 /// Supported semantic operation encoded by the Linux fallocate mode bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,21 +28,6 @@ pub fn classify_fallocate_mode(mode: u32) -> Option<FallocateKind> {
     }
 }
 
-#[derive(Debug, Clone, Copy, DekuRead, DekuWrite)]
-#[deku(
-    id_type = "u8",
-    ctx = "_endian: Endian",
-    ctx_default = "Endian::Little"
-)]
-pub enum LockType {
-    #[deku(id = "0")]
-    ReadLock, // F_RDLCK
-    #[deku(id = "1")]
-    WriteLock, // F_WRLCK
-    #[deku(id = "2")]
-    Unlock, // F_UNLCK
-}
-
 pub const P9_LOCK_FLAGS_BLOCK: u32 = 1; // blocking request
 
 pub const P9_CHANNEL_SIZE: usize = 1000;
@@ -53,78 +35,31 @@ pub const P9_DEBUG_BUFFER_SIZE: usize = 40;
 pub const P9_READDIR_BATCH_SIZE: usize = 1000;
 pub const P9_NOBODY_UID: u32 = 65534;
 
-/// Userspace 9P string. The shared [`WireString`] accepts other storage.
-pub type P9String = WireString<Vec<u8>>;
+/// Userspace string backed by shared frame storage.
+pub type P9String = WireString<Bytes>;
+pub type P9Bytes = WireBytes<Bytes>;
 
-impl WireString<Vec<u8>> {
-    pub fn new(data: Vec<u8>) -> Self {
-        Self::from_storage(data)
+impl WireString<Bytes> {
+    pub fn new(data: impl Into<Bytes>) -> Self {
+        Self::from_storage(data.into())
     }
 }
 
-impl<'a, B> DekuReader<'a, Endian> for WireString<B>
-where
-    B: ByteStorage + From<Vec<u8>>,
-{
-    fn from_reader_with_ctx<R: deku::no_std_io::Read + deku::no_std_io::Seek>(
-        reader: &mut Reader<R>,
-        endian: Endian,
-    ) -> Result<Self, DekuError> {
-        let len = u16::from_reader_with_ctx(reader, endian)?;
-        let mut data = alloc::vec![0; len as usize];
-        reader.read_bytes(len as usize, &mut data, Order::Lsb0)?;
-        Ok(Self {
-            len,
-            data: B::from(data),
-        })
+impl From<Vec<u8>> for WireBytes<Bytes> {
+    fn from(value: Vec<u8>) -> Self {
+        Self(Bytes::from(value))
     }
 }
 
-impl<'a, B> DekuReader<'a> for WireString<B>
-where
-    B: ByteStorage + From<Vec<u8>>,
-{
-    fn from_reader_with_ctx<R: deku::no_std_io::Read + deku::no_std_io::Seek>(
-        reader: &mut Reader<R>,
-        (): (),
-    ) -> Result<Self, DekuError> {
-        Self::from_reader_with_ctx(reader, Endian::Little)
+impl From<WireBytes<Bytes>> for Bytes {
+    fn from(value: WireBytes<Bytes>) -> Self {
+        value.0
     }
 }
 
-impl<B: ByteStorage> DekuWriter<Endian> for WireString<B> {
-    fn to_writer<W: deku::no_std_io::Write + deku::no_std_io::Seek>(
-        &self,
-        writer: &mut Writer<W>,
-        endian: Endian,
-    ) -> Result<(), DekuError> {
-        self.len.to_writer(writer, endian)?;
-        writer.write_bytes(self.data.as_ref())?;
-        Ok(())
-    }
-}
-
-impl<B: ByteStorage> DekuWriter for WireString<B> {
-    fn to_writer<W: deku::no_std_io::Write + deku::no_std_io::Seek>(
-        &self,
-        writer: &mut Writer<W>,
-        (): (),
-    ) -> Result<(), DekuError> {
-        self.to_writer(writer, Endian::Little)
-    }
-}
-
-impl<B: ByteStorage> DekuUpdate for WireString<B> {
-    fn update(&mut self) -> Result<(), DekuError> {
-        self.len = self.data.as_ref().len().try_into()?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct DirEntry {
     pub qid: Qid,
-    #[deku(endian = "little")]
     pub offset: u64,
     pub type_: u8,
     pub name: P9String,
@@ -137,15 +72,13 @@ impl DirEntry {
     }
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Tversion {
-    #[deku(endian = "little")]
     pub msize: u32,
     pub version: P9String,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tattach {
     pub fid: u32,
     pub afid: u32,
@@ -154,26 +87,21 @@ pub struct Tattach {
     pub n_uname: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Twalk {
     pub fid: u32,
     pub newfid: u32,
-    #[deku(update = "self.wnames.len()")]
     pub nwname: u16,
-    #[deku(count = "nwname")]
     pub wnames: Vec<P9String>,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tlopen {
     pub fid: u32,
     pub flags: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tlcreate {
     pub fid: u32,
     pub name: P9String,
@@ -182,49 +110,40 @@ pub struct Tlcreate {
     pub gid: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tread {
     pub fid: u32,
     pub offset: u64,
     pub count: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Twrite {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub offset: u64,
-    #[deku(endian = "little")]
     pub count: u32,
-    #[deku(ctx = "count")]
-    pub data: DekuBytes,
+    pub data: P9Bytes,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Tclunk {
-    #[deku(endian = "little")]
     pub fid: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Treaddir {
     pub fid: u32,
     pub offset: u64,
     pub count: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tgetattr {
     pub fid: u32,
     pub request_mask: u64,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tsetattr {
     pub fid: u32,
     pub valid: u32,
@@ -239,8 +158,7 @@ pub struct Tsetattr {
 }
 
 /// ZeroFS-private atomic fallocate request.
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tfallocate {
     pub fid: u32,
     pub offset: u64,
@@ -248,11 +166,10 @@ pub struct Tfallocate {
     pub mode: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rfallocate;
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tmkdir {
     pub dfid: u32,
     pub name: P9String,
@@ -260,8 +177,7 @@ pub struct Tmkdir {
     pub gid: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tsymlink {
     pub dfid: u32,
     pub name: P9String,
@@ -269,8 +185,7 @@ pub struct Tsymlink {
     pub gid: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tmknod {
     pub dfid: u32,
     pub name: P9String,
@@ -280,24 +195,21 @@ pub struct Tmknod {
     pub gid: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tlink {
     pub dfid: u32,
     pub fid: u32,
     pub name: P9String,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Trename {
     pub fid: u32,
     pub dfid: u32,
     pub name: P9String,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Trenameat {
     pub olddirfid: u32,
     pub oldname: P9String,
@@ -305,54 +217,47 @@ pub struct Trenameat {
     pub newname: P9String,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tunlinkat {
     pub dirfid: u32,
     pub name: P9String,
     pub flags: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tfsync {
     pub fid: u32,
     pub datasync: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Treadlink {
-    #[deku(endian = "little")]
     pub fid: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Tstatfs {
-    #[deku(endian = "little")]
     pub fid: u32,
 }
 
 // Core 9P structures
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Tflush {
-    #[deku(endian = "little")]
     pub oldtag: u16,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rflush;
 
 // Extended attributes
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Txattrwalk {
     pub fid: u32,
     pub newfid: u32,
     pub name: P9String,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tlock {
     pub fid: u32,
     pub lock_type: LockType,
@@ -363,8 +268,7 @@ pub struct Tlock {
     pub client_id: P9String,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tgetlock {
     pub fid: u32,
     pub lock_type: LockType,
@@ -374,14 +278,12 @@ pub struct Tgetlock {
     pub client_id: P9String,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rxattrwalk {
-    #[deku(endian = "little")]
     pub size: u64,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Rgetlock {
     pub lock_type: LockType,
     pub start: u64,
@@ -391,22 +293,20 @@ pub struct Rgetlock {
 }
 
 // Response messages
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rversion {
-    #[deku(endian = "little")]
     pub msize: u32,
     pub version: P9String,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rattach {
     pub qid: Qid,
 }
 
 // ZeroFS-private reconnect extension: binds a fresh fid to an existing inode by
 // id (not by re-walking a path), so reconnection survives renames/hardlinks.
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Trebind {
     pub fid: u32,
     pub inode_id: u64,
@@ -424,39 +324,32 @@ pub struct Trebind {
 }
 
 // Private compound requests require the ZeroFS dialect.
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Twalkgetattr {
     pub fid: u32,
     pub newfid: u32,
-    #[deku(update = "self.wnames.len()")]
     pub nwname: u16,
-    #[deku(count = "nwname")]
     pub wnames: Vec<P9String>,
 }
 
 // Returned only on a full walk; on any miss the server replies Rlerror.
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rwalkgetattr {
-    #[deku(endian = "little", update = "self.wqids.len()")]
     pub nwqid: u16,
-    #[deku(count = "nwqid")]
     pub wqids: Vec<Qid>,
     pub stat: Stat,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Treaddirattr {
     pub fid: u32,
     pub offset: u64,
     pub count: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct DirEntryPlus {
     pub qid: Qid,
-    #[deku(endian = "little")]
     pub offset: u64,
     pub type_: u8,
     pub name: P9String,
@@ -470,35 +363,30 @@ impl DirEntryPlus {
     }
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rreaddirattr {
-    #[deku(endian = "little", update = "self.data.len()")]
     pub count: u32,
-    #[deku(ctx = "count")]
-    pub data: DekuBytes,
+    pub data: P9Bytes,
 }
 
 // Tlopenat preserves `fid` and opens `newfid`. Tlcreateattr preserves `dfid`,
 // creates and opens `newfid`, and returns stat. Other *attr replies add stat to
 // the corresponding standard request layout.
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tlopenat {
     pub fid: u32,
     pub newfid: u32,
     pub flags: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rlopenat {
     pub qid: Qid,
-    #[deku(endian = "little")]
     pub iounit: u32,
 }
 
 // Tlopenatread combines Tlopenat with a best-effort Tread at offset zero.
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tlopenatread {
     pub fid: u32,
     pub newfid: u32,
@@ -507,21 +395,17 @@ pub struct Tlopenatread {
     pub count: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rlopenatread {
     pub qid: Qid,
-    #[deku(endian = "little")]
     pub iounit: u32,
     /// One when `data` reaches EOF; zero for an incomplete prefetch.
     pub eof: u8,
-    #[deku(endian = "little", update = "self.data.len()")]
     pub count: u32,
-    #[deku(ctx = "count")]
-    pub data: DekuBytes,
+    pub data: P9Bytes,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tlcreateattr {
     pub dfid: u32,
     pub newfid: u32,
@@ -531,171 +415,162 @@ pub struct Tlcreateattr {
     pub gid: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rmkdirattr {
     pub stat: Stat,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rsymlinkattr {
     pub stat: Stat,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rmknodattr {
     pub stat: Stat,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rlinkattr {
     pub stat: Stat,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rsetattrattr {
     pub stat: Stat,
 }
 
 impl Rreaddirattr {
-    pub fn from_entries(entries: Vec<DirEntryPlus>) -> Result<Self, DekuError> {
-        use deku::DekuContainerWrite;
-        let mut data = Vec::with_capacity(entries.iter().map(DirEntryPlus::wire_size).sum());
+    pub fn from_entries(entries: Vec<DirEntryPlus>) -> Result<Self, CodecError> {
+        let size = entries.iter().try_fold(0usize, |n, entry| {
+            n.checked_add(entry.wire_size())
+                .ok_or(CodecError::LengthOverflow)
+        })?;
+        let mut data = alloc::vec![0; size];
+        let mut cursor = 0;
         for entry in entries {
-            data.extend_from_slice(&entry.to_bytes()?);
+            cursor += entry.to_slice(&mut data[cursor..])?;
         }
-        Ok(Rreaddirattr {
-            count: data.len() as u32,
-            data: DekuBytes::from(data),
+        Ok(Self {
+            count: size.try_into()?,
+            data: data.into(),
         })
     }
-
-    pub fn to_entries(&self) -> Result<Vec<DirEntryPlus>, DekuError> {
-        use deku::DekuContainerRead;
+    pub fn to_entries(&self) -> Result<Vec<DirEntryPlus>, CodecError> {
+        let mut input = self.data.0.clone();
         let mut entries = Vec::new();
-        let mut input = (&self.data.0[..], 0);
-        while !input.0.is_empty() {
-            let (remaining, entry) = DirEntryPlus::from_bytes(input)?;
-            input = remaining;
+        while !input.is_empty() {
+            let (entry, length) = DirEntryPlus::decode(&input)?;
             entries.push(entry);
+            input.advance(length);
         }
         Ok(entries)
     }
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rwalk {
-    #[deku(endian = "little", update = "self.wqids.len()")]
     pub nwqid: u16,
-    #[deku(count = "nwqid")]
     pub wqids: Vec<Qid>,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rlcreate {
     pub qid: Qid,
-    #[deku(endian = "little")]
     pub iounit: u32,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rread {
-    #[deku(endian = "little", update = "self.data.len()")]
     pub count: u32,
-    #[deku(ctx = "count")]
-    pub data: DekuBytes,
+    pub data: P9Bytes,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rreaddir {
-    #[deku(endian = "little", update = "self.data.len()")]
     pub count: u32,
-    #[deku(ctx = "count")]
-    pub data: DekuBytes,
+    pub data: P9Bytes,
 }
 
 impl Rreaddir {
-    pub fn from_entries(entries: Vec<DirEntry>) -> Result<Self, DekuError> {
-        use deku::DekuContainerWrite;
-
-        let mut data = Vec::with_capacity(entries.iter().map(DirEntry::wire_size).sum());
+    pub fn from_entries(entries: Vec<DirEntry>) -> Result<Self, CodecError> {
+        let size = entries.iter().try_fold(0usize, |n, entry| {
+            n.checked_add(entry.wire_size())
+                .ok_or(CodecError::LengthOverflow)
+        })?;
+        let mut data = alloc::vec![0; size];
+        let mut cursor = 0;
         for entry in entries {
-            let bytes = entry.to_bytes()?;
-            data.extend_from_slice(&bytes);
+            cursor += entry.to_slice(&mut data[cursor..])?;
         }
-
-        Ok(Rreaddir {
-            count: data.len() as u32,
-            data: DekuBytes::from(data),
+        Ok(Self {
+            count: size.try_into()?,
+            data: data.into(),
         })
     }
-
-    pub fn to_entries(&self) -> Result<Vec<DirEntry>, DekuError> {
-        use deku::DekuContainerRead;
-
+    pub fn to_entries(&self) -> Result<Vec<DirEntry>, CodecError> {
+        let mut input = self.data.0.clone();
         let mut entries = Vec::new();
-        let mut input = (&self.data.0[..], 0);
-        while !input.0.is_empty() {
-            let (remaining, entry) = DirEntry::from_bytes(input)?;
-            input = remaining;
+        while !input.is_empty() {
+            let (entry, length) = DirEntry::decode(&input)?;
             entries.push(entry);
+            input.advance(length);
         }
-
         Ok(entries)
     }
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rmkdir {
     pub qid: Qid,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rsymlink {
     pub qid: Qid,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rmknod {
     pub qid: Qid,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rreadlink {
     pub target: P9String,
 }
 
 // Empty responses
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rclunk;
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rsetattr;
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rrename;
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rlink;
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rrenameat;
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Runlinkat;
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Rfsync;
 
 /// Queries the connection's durability lineage and writer epoch.
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[derive(Debug, Clone)]
 pub struct Tgetlineage;
 
 /// Durability-verified fsync carrying the oldest unverified lineage token.
 /// `datasync` contains `P9_FSYNC_*` flags; without `P9_FSYNC_INODE` the barrier
 /// is filesystem-wide. Token zero denotes no pending mutation in that scope. A
 /// lineage mismatch returns `ESTALE`.
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
+#[derive(Debug, Clone)]
 pub struct Tfsyncdur {
     pub fid: u32,
     pub datasync: u32,
@@ -723,174 +598,89 @@ pub const T_SETATTRATTR: u8 = message_type::TSETATTRATTR;
 pub const T_FALLOCATE: u8 = message_type::TFALLOCATE;
 pub const R_FALLOCATE: u8 = message_type::RFALLOCATE;
 
-// Response IDs used by the owned counted-payload decoder.
-const R_READ: u8 = message_type::RREAD;
-const R_READDIR: u8 = message_type::RREADDIR;
-const R_LOPENATREAD: u8 = message_type::RLOPENATREAD;
-const R_READDIRATTR: u8 = message_type::RREADDIRATTR;
-
 // Main message enum
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(ctx = "_type: u8", id = "_type")]
+#[derive(Debug, Clone)]
 pub enum Message {
-    #[deku(id = "message_type::TVERSION")]
     Tversion(Tversion),
-    #[deku(id = "message_type::RVERSION")]
     Rversion(Rversion),
-    #[deku(id = "message_type::TATTACH")]
     Tattach(Tattach),
-    #[deku(id = "message_type::RATTACH")]
     Rattach(Rattach),
-    #[deku(id = "message_type::TWALK")]
     Twalk(Twalk),
-    #[deku(id = "message_type::RWALK")]
     Rwalk(Rwalk),
-    #[deku(id = "message_type::TLOPEN")]
     Tlopen(Tlopen),
-    #[deku(id = "message_type::RLOPEN")]
     Rlopen(Rlopen),
-    #[deku(id = "message_type::TLCREATE")]
     Tlcreate(Tlcreate),
-    #[deku(id = "message_type::RLCREATE")]
     Rlcreate(Rlcreate),
-    #[deku(id = "message_type::TREAD")]
     Tread(Tread),
-    #[deku(id = "message_type::RREAD")]
     Rread(Rread),
-    #[deku(id = "message_type::TWRITE")]
     Twrite(Twrite),
-    #[deku(id = "message_type::RWRITE")]
     Rwrite(Rwrite),
-    #[deku(id = "message_type::TCLUNK")]
     Tclunk(Tclunk),
-    #[deku(id = "message_type::RCLUNK")]
     Rclunk(Rclunk),
-    #[deku(id = "message_type::TREADDIR")]
     Treaddir(Treaddir),
-    #[deku(id = "message_type::RREADDIR")]
     Rreaddir(Rreaddir),
-    #[deku(id = "message_type::TGETATTR")]
     Tgetattr(Tgetattr),
-    #[deku(id = "message_type::RGETATTR")]
     Rgetattr(Rgetattr),
-    #[deku(id = "message_type::TSETATTR")]
     Tsetattr(Tsetattr),
-    #[deku(id = "message_type::RSETATTR")]
     Rsetattr(Rsetattr),
-    #[deku(id = "message_type::TFALLOCATE")]
     Tfallocate(Tfallocate),
-    #[deku(id = "message_type::RFALLOCATE")]
     Rfallocate(Rfallocate),
-    #[deku(id = "message_type::TMKDIR")]
     Tmkdir(Tmkdir),
-    #[deku(id = "message_type::RMKDIR")]
     Rmkdir(Rmkdir),
-    #[deku(id = "message_type::TSYMLINK")]
     Tsymlink(Tsymlink),
-    #[deku(id = "message_type::RSYMLINK")]
     Rsymlink(Rsymlink),
-    #[deku(id = "message_type::TMKNOD")]
     Tmknod(Tmknod),
-    #[deku(id = "message_type::RMKNOD")]
     Rmknod(Rmknod),
-    #[deku(id = "message_type::TREADLINK")]
     Treadlink(Treadlink),
-    #[deku(id = "message_type::RREADLINK")]
     Rreadlink(Rreadlink),
-    #[deku(id = "message_type::TLINK")]
     Tlink(Tlink),
-    #[deku(id = "message_type::RLINK")]
     Rlink(Rlink),
-    #[deku(id = "message_type::TRENAME")]
     Trename(Trename),
-    #[deku(id = "message_type::RRENAME")]
     Rrename(Rrename),
-    #[deku(id = "message_type::TRENAMEAT")]
     Trenameat(Trenameat),
-    #[deku(id = "message_type::RRENAMEAT")]
     Rrenameat(Rrenameat),
-    #[deku(id = "message_type::TUNLINKAT")]
     Tunlinkat(Tunlinkat),
-    #[deku(id = "message_type::RUNLINKAT")]
     Runlinkat(Runlinkat),
-    #[deku(id = "message_type::TFSYNC")]
     Tfsync(Tfsync),
-    #[deku(id = "message_type::RFSYNC")]
     Rfsync(Rfsync),
-    #[deku(id = "message_type::TFSYNCDUR")]
     Tfsyncdur(Tfsyncdur),
-    #[deku(id = "message_type::TGETLINEAGE")]
     Tgetlineage(Tgetlineage),
-    #[deku(id = "message_type::RGETLINEAGE")]
     Rgetlineage(Rgetlineage),
-    #[deku(id = "message_type::TLOCK")]
     Tlock(Tlock),
-    #[deku(id = "message_type::RLOCK")]
     Rlock(Rlock),
-    #[deku(id = "message_type::TGETLOCK")]
     Tgetlock(Tgetlock),
-    #[deku(id = "message_type::RGETLOCK")]
     Rgetlock(Rgetlock),
-    #[deku(id = "message_type::RLERROR")]
     Rlerror(Rlerror),
-    #[deku(id = "message_type::TFLUSH")]
     Tflush(Tflush),
-    #[deku(id = "message_type::RFLUSH")]
     Rflush(Rflush),
-    #[deku(id = "message_type::TXATTRWALK")]
     Txattrwalk(Txattrwalk),
-    #[deku(id = "message_type::RXATTRWALK")]
     Rxattrwalk(Rxattrwalk),
-    #[deku(id = "message_type::TSTATFS")]
     Tstatfs(Tstatfs),
-    #[deku(id = "message_type::RSTATFS")]
     Rstatfs(Rstatfs),
     // Private compound extensions use IDs outside the standard 9P range. The
     // *attr requests keep the standard request layout and return a richer reply.
-    #[deku(id = "message_type::TLOPENAT")]
     Tlopenat(Tlopenat),
-    #[deku(id = "message_type::RLOPENAT")]
     Rlopenat(Rlopenat),
-    #[deku(id = "message_type::TLOPENATREAD")]
     Tlopenatread(Tlopenatread),
-    #[deku(id = "message_type::RLOPENATREAD")]
     Rlopenatread(Rlopenatread),
-    #[deku(id = "message_type::TLCREATEATTR")]
     Tlcreateattr(Tlcreateattr),
-    #[deku(id = "message_type::RLCREATEATTR")]
     Rlcreateattr(Rlcreateattr),
-    #[deku(id = "message_type::TMKDIRATTR")]
     Tmkdirattr(Tmkdir),
-    #[deku(id = "message_type::RMKDIRATTR")]
     Rmkdirattr(Rmkdirattr),
-    #[deku(id = "message_type::TSYMLINKATTR")]
     Tsymlinkattr(Tsymlink),
-    #[deku(id = "message_type::RSYMLINKATTR")]
     Rsymlinkattr(Rsymlinkattr),
-    #[deku(id = "message_type::TMKNODATTR")]
     Tmknodattr(Tmknod),
-    #[deku(id = "message_type::RMKNODATTR")]
     Rmknodattr(Rmknodattr),
-    #[deku(id = "message_type::TLINKATTR")]
     Tlinkattr(Tlink),
-    #[deku(id = "message_type::RLINKATTR")]
     Rlinkattr(Rlinkattr),
-    #[deku(id = "message_type::TSETATTRATTR")]
     Tsetattrattr(Tsetattr),
-    #[deku(id = "message_type::RSETATTRATTR")]
     Rsetattrattr(Rsetattrattr),
     // ZeroFS-private reconnect extension (ids outside the standard 9P range).
-    #[deku(id = "message_type::TREBIND")]
     Trebind(Trebind),
-    #[deku(id = "message_type::RREBIND")]
     Rrebind(Rrebind),
-    #[deku(id = "message_type::TWALKGETATTR")]
     Twalkgetattr(Twalkgetattr),
-    #[deku(id = "message_type::RWALKGETATTR")]
     Rwalkgetattr(Rwalkgetattr),
-    #[deku(id = "message_type::TREADDIRATTR")]
     Treaddirattr(Treaddirattr),
-    #[deku(id = "message_type::RREADDIRATTR")]
     Rreaddirattr(Rreaddirattr),
 }
 
@@ -1099,196 +889,100 @@ impl Message {
     }
 }
 
-/// Byte offset of the `type` field within a 9P frame (after the u32 size).
-const P9_TYPE_OFFSET: usize = P9_SIZE_FIELD_LEN;
-// The context controls whether ZeroFS mutation envelopes are present after the
-// standard header. Standard 9P remains the default for Deku's container APIs.
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(ctx = "op_id_enabled: bool", ctx_default = "false")]
+/// An owned 9P frame.
+#[derive(Debug, Clone)]
 pub struct P9Message {
-    #[deku(endian = "little")]
     pub size: u32,
     pub type_: u8,
-    #[deku(endian = "little")]
     pub tag: u16,
-    #[deku(
-        skip,
-        cond = "!op_id_enabled || !P9Message::carries_op_id(*type_)",
-        default = "[0u8; 16]"
-    )]
     pub op_id: [u8; 16],
-    #[deku(
-        skip,
-        cond = "!op_id_enabled || !P9Message::carries_op_id(*type_)",
-        default = "0"
-    )]
     pub op_flags: u8,
-    #[deku(
-        endian = "little",
-        skip,
-        cond = "!op_id_enabled || !P9Message::carries_op_id(*type_)",
-        default = "0"
-    )]
     pub op_origin_epoch: u64,
-    #[deku(ctx = "*type_")]
     pub body: Message,
 }
 
 impl P9Message {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, DekuError> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, CodecError> {
         self.to_bytes_ctx(false)
     }
 
-    /// Encode into caller-owned storage without allocating.
-    pub fn to_slice_ctx(&self, output: &mut [u8], op_id_enabled: bool) -> Result<usize, DekuError> {
-        let written = {
-            let mut cursor = Cursor::new(&mut *output);
-            let mut writer = Writer::new(&mut cursor);
-            DekuWriter::to_writer(self, &mut writer, op_id_enabled)?;
-            writer.finalize()?;
-            writer.bits_written / 8
-        };
-        let size: u32 = written.try_into()?;
-        let size_field = output
-            .get_mut(..P9_SIZE_FIELD_LEN)
-            .ok_or(DekuError::Incomplete(NeedSize::new(
-                P9_SIZE_FIELD_LEN * u8::BITS as usize,
-            )))?;
-        size_field.copy_from_slice(&size.to_le_bytes());
-        Ok(written)
+    pub fn to_bytes_ctx(&self, op_id_enabled: bool) -> Result<Vec<u8>, CodecError> {
+        Self::encode_body(self.tag, self.envelope(), &self.body, op_id_enabled)
     }
 
-    /// Encodes covered mutations with a private envelope after the tag.
-    pub fn to_bytes_ctx(&self, op_id_enabled: bool) -> Result<Vec<u8>, DekuError> {
-        let mut bytes = Vec::new();
-        let mut cursor = Cursor::new(&mut bytes);
-        let mut writer = Writer::new(&mut cursor);
-        DekuWriter::to_writer(self, &mut writer, op_id_enabled)?;
-        writer.finalize()?;
-        let size = bytes.len() as u32;
-        bytes[..P9_SIZE_FIELD_LEN].copy_from_slice(&size.to_le_bytes());
-        Ok(bytes)
-    }
-
-    /// Decode from any no-std I/O source supported by Deku.
-    pub fn from_reader_ctx<R>(
-        reader: &mut Reader<R>,
+    pub fn encode_body(
+        tag: u16,
+        envelope: MutationEnvelope,
+        body: &Message,
         op_id_enabled: bool,
-    ) -> Result<P9Message, DekuError>
-    where
-        R: deku::no_std_io::Read + deku::no_std_io::Seek,
-    {
-        P9Message::from_reader_with_ctx(reader, op_id_enabled)
-    }
-
-    /// Decodes a standard frame with an optional private mutation envelope.
-    pub fn from_bytes_ctx(input: &[u8], op_id_enabled: bool) -> Result<P9Message, DekuError> {
-        let mut cursor = Cursor::new(input);
-        let mut reader = Reader::new(&mut cursor);
-        Self::from_reader_ctx(&mut reader, op_id_enabled)
-    }
-
-    fn counted_payload_offset(type_: u8, op_id_enabled: bool) -> Option<usize> {
-        match type_ {
-            R_READ | R_READDIR | R_READDIRATTR => Some(P9_IOHDRSZ as usize),
-            R_LOPENATREAD => Some(P9_RLOPENATREAD_HDR as usize),
-            T_WRITE => {
-                Some(P9_TWRITE_HDR as usize + if op_id_enabled { P9_OP_ENVELOPE_LEN } else { 0 })
-            }
-            _ => None,
+    ) -> Result<Vec<u8>, CodecError> {
+        let view = body.as_view();
+        let size = slice_codec::encoded_frame_size(&view, op_id_enabled)?;
+        if size > P9_MAX_MSIZE as usize {
+            return Err(CodecError::MessageTooLarge);
         }
+        let mut output = alloc::vec![0; size];
+        slice_codec::encode_frame(
+            &mut output,
+            P9_MAX_MSIZE,
+            tag,
+            envelope,
+            &view,
+            op_id_enabled,
+        )?;
+        Ok(output)
     }
 
-    /// Decodes a frame, retaining its allocation for counted payloads.
-    ///
-    /// Only the fixed prefix is copied into a small stack buffer for canonical
-    /// Deku decoding. The trailing payload remains a [`Bytes`] view of the
-    /// transport frame.
-    pub fn from_owned_bytes_ctx(
-        mut input: Bytes,
+    pub fn to_slice_ctx(
+        &self,
+        output: &mut [u8],
         op_id_enabled: bool,
-    ) -> Result<P9Message, DekuError> {
-        let Some(type_) = input.get(P9_TYPE_OFFSET).copied() else {
-            return Self::from_bytes_ctx(&input, op_id_enabled);
-        };
-        let Some(payload_offset) = Self::counted_payload_offset(type_, op_id_enabled) else {
-            return Self::from_bytes_ctx(&input, op_id_enabled);
-        };
-
-        if input.len() < payload_offset {
-            return Self::from_bytes_ctx(&input, op_id_enabled);
-        }
-        let size = u32::from_le_bytes(
-            input[..P9_SIZE_FIELD_LEN]
-                .try_into()
-                .expect("the counted-payload prefix contains the frame header"),
-        );
-        let count_offset = payload_offset - P9_COUNT_FIELD_LEN;
-        let count = u32::from_le_bytes(
-            input[count_offset..payload_offset]
-                .try_into()
-                .expect("the counted-payload prefix length was checked"),
-        );
-        let payload_end = payload_offset
-            .checked_add(count as usize)
-            .ok_or(deku::deku_error!(
-                DekuError::Parse,
-                "9P payload length overflow"
-            ))?;
-        if input.len() < payload_end {
-            return Err(deku::deku_error!(
-                DekuError::Parse,
-                "9P count exceeds the available payload"
-            ));
-        }
-
-        const MAX_COUNTED_PREFIX: usize = P9_TWRITE_HDR as usize + P9_OP_ENVELOPE_LEN;
-        let mut prefix = [0u8; MAX_COUNTED_PREFIX];
-        prefix[..payload_offset].copy_from_slice(&input[..payload_offset]);
-        prefix[..P9_SIZE_FIELD_LEN].copy_from_slice(&(payload_offset as u32).to_le_bytes());
-        prefix[count_offset..payload_offset].fill(0);
-
-        let mut message = Self::from_bytes_ctx(&prefix[..payload_offset], op_id_enabled)?;
-        message.size = size;
-
-        input.truncate(payload_end);
-        input.advance(payload_offset);
-        let (decoded_count, decoded_data) = match &mut message.body {
-            Message::Rread(message) => (&mut message.count, &mut message.data),
-            Message::Rreaddir(message) => (&mut message.count, &mut message.data),
-            Message::Rlopenatread(message) => (&mut message.count, &mut message.data),
-            Message::Twrite(message) => (&mut message.count, &mut message.data),
-            Message::Rreaddirattr(message) => (&mut message.count, &mut message.data),
-            _ => {
-                return Err(deku::deku_error!(
-                    DekuError::Parse,
-                    "counted-payload frame decoded as the wrong message type"
-                ));
-            }
-        };
-        *decoded_count = count;
-        *decoded_data = DekuBytes::from(input);
-
-        Ok(message)
-    }
-
-    /// Whether this request type carries the private mutation envelope.
-    pub fn carries_op_id(type_: u8) -> bool {
-        matches!(
-            type_,
-            // base 9P2000.L mutations
-            T_LCREATE | T_SYMLINK | T_MKNOD | T_RENAME | T_SETATTR | T_WRITE | T_LINK | T_MKDIR | T_RENAMEAT | T_UNLINKAT | T_FALLOCATE
-            // compound mutation forms
-            | T_LCREATEATTR | T_MKDIRATTR | T_SYMLINKATTR | T_MKNODATTR | T_LINKATTR
-            // setattr compound form
-            | T_SETATTRATTR
+    ) -> Result<usize, CodecError> {
+        slice_codec::encode_frame(
+            output,
+            P9_MAX_MSIZE,
+            self.tag,
+            self.envelope(),
+            &self.body.as_view(),
+            op_id_enabled,
         )
     }
 
+    fn envelope(&self) -> MutationEnvelope {
+        MutationEnvelope {
+            op_id: self.op_id,
+            flags: self.op_flags,
+            origin_writer_epoch: self.op_origin_epoch,
+        }
+    }
+
+    pub fn from_bytes_ctx(input: &[u8], op_id_enabled: bool) -> Result<Self, CodecError> {
+        let header = slice_codec::decode_header(input, P9_MAX_MSIZE)?;
+        if header.size as usize != input.len() {
+            return Err(CodecError::FrameSizeMismatch);
+        }
+        Self::from_owned_bytes_ctx(Bytes::copy_from_slice(input), op_id_enabled)
+    }
+
+    pub fn from_owned_bytes_ctx(input: Bytes, op_id_enabled: bool) -> Result<Self, CodecError> {
+        let frame = slice_codec::decode_frame(&input, P9_MAX_MSIZE, op_id_enabled)?;
+        Ok(Self {
+            size: frame.header.size,
+            type_: frame.header.type_,
+            tag: frame.header.tag,
+            op_id: frame.envelope.op_id,
+            op_flags: frame.envelope.flags,
+            op_origin_epoch: frame.envelope.origin_writer_epoch,
+            body: Message::from_view(frame.body, &input)?,
+        })
+    }
+
+    pub fn carries_op_id(type_: u8) -> bool {
+        slice_codec::carries_op_id(type_)
+    }
+
     pub fn new(tag: u16, body: Message) -> Self {
-        let type_ = body
-            .deku_id()
-            .expect("every Message variant has a fixed 9P type id");
+        let type_ = body.as_view().type_id();
 
         Self {
             size: 0,
@@ -1326,39 +1020,6 @@ impl P9Message {
 mod tests {
     use super::*;
     use alloc::vec;
-    use deku::DekuContainerWrite;
-
-    #[derive(DekuWrite)]
-    struct BorrowedStringMessage<'a> {
-        value: WireString<&'a [u8]>,
-    }
-
-    /// Reference implementation of the former two-step encoder. Keeping this
-    /// in tests makes the contextual encoder's wire compatibility explicit.
-    fn legacy_enveloped_bytes(message: &P9Message) -> Vec<u8> {
-        let mut bytes = DekuContainerWrite::to_bytes(message).unwrap();
-        bytes.splice(
-            P9_HEADER_SIZE..P9_HEADER_SIZE,
-            message
-                .op_id
-                .iter()
-                .copied()
-                .chain(std::iter::once(message.op_flags))
-                .chain(message.op_origin_epoch.to_le_bytes()),
-        );
-        let size = bytes.len() as u32;
-        bytes[..P9_SIZE_FIELD_LEN].copy_from_slice(&size.to_le_bytes());
-        bytes
-    }
-
-    #[test]
-    fn borrowed_string_storage_encodes_without_ownership_conversion() {
-        let message = BorrowedStringMessage {
-            value: WireString::from_storage(b"kernel-name".as_slice()),
-        };
-
-        assert_eq!(message.to_bytes().unwrap(), b"\x0b\0kernel-name".as_slice());
-    }
 
     #[test]
     fn caller_owned_output_matches_allocating_encoder() {
@@ -1521,7 +1182,7 @@ mod tests {
             }),
         );
         let bytes = msg.to_bytes().unwrap();
-        let (_, decoded) = P9Message::from_bytes((&bytes, 0)).unwrap();
+        let decoded = P9Message::from_bytes_ctx(&bytes, false).unwrap();
         assert_eq!(decoded.type_, T_FALLOCATE);
         assert_eq!(decoded.body.durability_fid(), Some(42));
         match decoded.body {
@@ -1549,28 +1210,6 @@ mod tests {
         assert_eq!(decoded.op_origin_epoch, 42);
         assert_eq!(decoded.tag, 5);
         assert!(matches!(decoded.body, Message::Tmkdir(_)));
-    }
-
-    #[test]
-    fn contextual_envelope_is_byte_for_byte_compatible_with_legacy_splicing() {
-        let payload = (0u8..=255).cycle().take(257).collect::<Vec<_>>();
-        let message = P9Message::new_with_op_id_flags_and_origin(
-            0x1234,
-            std::array::from_fn(|index| index as u8),
-            P9_OP_FLAG_RETRY,
-            0x0807_0605_0403_0201,
-            Message::Twrite(Twrite {
-                fid: 0x1122_3344,
-                offset: 0x0102_0304_0506_0708,
-                count: payload.len() as u32,
-                data: payload.into(),
-            }),
-        );
-
-        assert_eq!(
-            message.to_bytes_ctx(true).unwrap(),
-            legacy_enveloped_bytes(&message)
-        );
     }
 
     #[test]
@@ -1667,7 +1306,77 @@ mod tests {
     }
 
     #[test]
-    fn owned_decoder_matches_borrowed_trailing_data_semantics() {
+    fn owned_metadata_and_directory_names_alias_the_input_frame() {
+        let name = P9String::new(Bytes::from_static(b"name\xff"));
+        let bodies = [
+            Message::Twalk(Twalk {
+                fid: 1,
+                newfid: 2,
+                nwname: 1,
+                wnames: vec![name.clone()],
+            }),
+            Message::Tsymlink(Tsymlink {
+                dfid: 1,
+                name: name.clone(),
+                symtgt: P9String::new(Bytes::from_static(b"target")),
+                gid: 0,
+            }),
+            Message::Rreaddir(
+                Rreaddir::from_entries(vec![DirEntry {
+                    qid: qid(),
+                    offset: 1,
+                    type_: 0,
+                    name: name.clone(),
+                }])
+                .unwrap(),
+            ),
+            Message::Rreaddirattr(
+                Rreaddirattr::from_entries(vec![DirEntryPlus {
+                    qid: qid(),
+                    offset: 1,
+                    type_: 0,
+                    name,
+                    stat: stat(),
+                }])
+                .unwrap(),
+            ),
+        ];
+        for body in bodies {
+            let message = P9Message::new(1, body);
+            for dialect in [false, true] {
+                let frame = Bytes::from(message.to_bytes_ctx(dialect).unwrap());
+                let start = frame.as_ptr() as usize;
+                let end = start + frame.len();
+                let decoded = P9Message::from_owned_bytes_ctx(frame, dialect).unwrap();
+                let names = match decoded.body {
+                    Message::Twalk(walk) => walk.wnames,
+                    Message::Tsymlink(link) => vec![link.name, link.symtgt],
+                    Message::Rreaddir(dir) => dir
+                        .to_entries()
+                        .unwrap()
+                        .into_iter()
+                        .map(|entry| entry.name)
+                        .collect(),
+                    Message::Rreaddirattr(dir) => dir
+                        .to_entries()
+                        .unwrap()
+                        .into_iter()
+                        .map(|entry| entry.name)
+                        .collect(),
+                    _ => unreachable!(),
+                };
+                assert!(!names.is_empty());
+                for name in names {
+                    let ptr = name.data.as_ptr() as usize;
+                    assert!(!name.is_empty());
+                    assert!(ptr >= start && ptr + name.len() <= end);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_and_borrowed_decoders_reject_trailing_data() {
         let mut frame = P9Message::new(
             27,
             Message::Rread(Rread {
@@ -1679,12 +1388,14 @@ mod tests {
         .unwrap();
         frame[P9_HEADER_SIZE..P9_IOHDRSZ as usize].copy_from_slice(&3u32.to_le_bytes());
 
-        let borrowed = P9Message::from_bytes_ctx(&frame, false).unwrap();
-        let owned = P9Message::from_owned_bytes_ctx(Bytes::from(frame), false).unwrap();
-        let (count, data) = counted_payload(&owned);
-        assert_eq!(count, 3);
-        assert_eq!(data.as_ref(), b"pay");
-        assert_eq!(owned.to_bytes().unwrap(), borrowed.to_bytes().unwrap());
+        assert_eq!(
+            P9Message::from_bytes_ctx(&frame, false).unwrap_err(),
+            CodecError::TrailingData
+        );
+        assert_eq!(
+            P9Message::from_owned_bytes_ctx(Bytes::from(frame), false).unwrap_err(),
+            CodecError::TrailingData
+        );
     }
 
     #[test]
@@ -1786,7 +1497,7 @@ mod tests {
             "standard framing carries no op-id"
         );
         assert_eq!(decoded.op_flags, 0);
-        let (_, plain) = P9Message::from_bytes((&without, 0)).unwrap();
+        let plain = P9Message::from_bytes_ctx(&without, false).unwrap();
         assert_eq!(plain.tag, 5);
     }
 
@@ -1812,7 +1523,7 @@ mod tests {
             }),
         );
         let bytes = msg.to_bytes().unwrap();
-        let (_, decoded) = P9Message::from_bytes((&bytes, 0)).unwrap();
+        let decoded = P9Message::from_bytes_ctx(&bytes, false).unwrap();
         match decoded.body {
             Message::Trebind(rebind) => {
                 assert_eq!(rebind.fid, 9);
@@ -1853,7 +1564,7 @@ mod tests {
             }),
         );
         let bytes = msg.to_bytes().unwrap();
-        let (_, decoded) = P9Message::from_bytes((&bytes, 0)).unwrap();
+        let decoded = P9Message::from_bytes_ctx(&bytes, false).unwrap();
         match decoded.body {
             Message::Trebind(rebind) => {
                 assert_eq!(rebind.uname.data, credentials);

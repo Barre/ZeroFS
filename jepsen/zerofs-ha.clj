@@ -1,5 +1,5 @@
 (ns jepsen.local-fs.db.zerofs-ha
-  "HA ZeroFS: leader + standby over one shared S3 (MinIO) store, mounted
+  "HA ZeroFS: leader + standby over one shared S3 (SeaweedFS) store, mounted
   multi-target so the FUSE client re-routes on failover. The fault is a leader
   FAILOVER (kill leader, standby promotes, full-restart to canonical roles).
   Semi-sync acks every write to the standby before acking, so failover loses no
@@ -53,8 +53,8 @@
          "encryption_password = \"" password "\"\n\n"
          "[aws]\n"
          "endpoint = \"http://127.0.0.1:9000\"\n"
-         "access_key_id = \"minioadmin\"\n"
-         "secret_access_key = \"minioadmin\"\n"
+         "access_key_id = \"zerofsadmin\"\n"
+         "secret_access_key = \"zerofsadmin\"\n"
          "allow_http = \"true\"\n\n"
          "[servers.ninep]\n"
          "addresses = [\"127.0.0.1:" (ninep-port port node-key) "\"]\n\n"

@@ -107,7 +107,7 @@ sudo zpool set autotrim=on mypool
 sudo zpool trim mypool
 ```
 
-TRIM deletes extent pointers for fully covered extents and debits the affected segments' live-byte counters. Segment garbage collection later deletes empty segments or repacks fragmented ones; object-store usage does not necessarily decrease immediately. See [Garbage collection](/garbage-collection).
+TRIM deletes extent pointers for fully covered extents and debits the affected segments' live-byte counters. Segment reclamation later deletes empty segments or repacks fragmented ones; object-store usage does not necessarily decrease immediately. See [Space Reclamation](/space-reclamation).
 
 WRITE_ZEROES uses the normal write path. An extent that becomes entirely zero is reduced to a pointer deletion, but partially covered extents are rewritten. TRIM is cheaper when the caller only needs to discard data.
 

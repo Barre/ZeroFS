@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use foyer::{Cache, HybridCache};
 use futures::FutureExt;
 use futures::StreamExt;
@@ -32,10 +32,10 @@ const PREFETCH_DEPTH_WINDOWS: usize = 4;
 
 type PartId = usize;
 
-/// One window GET shared by every reader whose part falls inside it. Resolves
-/// to `(base part id, window bytes)`; a joiner slices out its part. The error
-/// is Arc-wrapped so the output is `Clone`, which `Shared` requires.
-type SharedFetch = Shared<BoxFuture<'static, Result<(PartId, Bytes), Arc<object_store::Error>>>>;
+type FetchedParts = (PartId, Arc<[Bytes]>);
+
+/// One window GET shared by readers of any part in the window.
+type SharedFetch = Shared<BoxFuture<'static, Result<FetchedParts, Arc<object_store::Error>>>>;
 
 /// Single-flight registry for all window fetches, demand and prefetch alike:
 /// every part covered by an in-flight GET maps to its shared fetch, so anything
@@ -788,78 +788,94 @@ impl PrefetchingObjectStore {
     where
         S: stream::Stream<Item = Result<Bytes, object_store::Error>> + Unpin,
     {
-        let mut buffer = BytesMut::new();
         let mut part_number = start_part_number;
-
-        // Owned copies: `split_to(..).freeze()` would share the BytesMut
-        // allocation between neighbouring parts, invisibly to the weigher.
+        let mut cache_part = |bytes| {
+            parts.insert(PartKey::new(location, part_number), bytes);
+            part_number += 1;
+        };
+        // Insert completed parts immediately so unbounded GETs only stage one
+        // unfinished part outside the cache, in addition to the incoming chunk.
+        let mut pending = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let mut chunk = chunk?;
-            if skip > 0 {
-                let n = skip.min(chunk.len());
-                chunk = chunk.slice(n..);
-                skip -= n;
-                if chunk.is_empty() {
-                    continue;
-                }
-            }
-            buffer.extend_from_slice(&chunk);
-            while buffer.len() >= part_size_bytes {
-                let to_write = buffer.split_to(part_size_bytes);
-                parts.insert(
-                    PartKey::new(location, part_number),
-                    Bytes::copy_from_slice(&to_write),
-                );
-                part_number += 1;
-            }
+            let chunk = chunk?;
+            let n = skip.min(chunk.len());
+            skip -= n;
+            Self::append_parts(&mut cache_part, &mut pending, part_size_bytes, &chunk[n..]);
         }
-
-        if !buffer.is_empty() {
-            parts.insert(
-                PartKey::new(location, part_number),
-                Bytes::copy_from_slice(&buffer),
-            );
+        if !pending.is_empty() {
+            cache_part(Bytes::from(pending.into_boxed_slice()));
         }
         Ok(())
+    }
+
+    /// Each part owns its allocation so the cache weigher accounts for all
+    /// retained bytes. Slices could keep an entire fetch window alive.
+    async fn collect_parts<S>(
+        mut stream: S,
+        part_size: usize,
+        mut skip: usize,
+    ) -> object_store::Result<Vec<Bytes>>
+    where
+        S: stream::Stream<Item = object_store::Result<Bytes>> + Unpin,
+    {
+        let mut parts = Vec::new();
+        let mut pending = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let n = skip.min(chunk.len());
+            skip -= n;
+            Self::append_parts(
+                |bytes| parts.push(bytes),
+                &mut pending,
+                part_size,
+                &chunk[n..],
+            );
+        }
+        if !pending.is_empty() {
+            // A short final part must not retain a full-part allocation.
+            parts.push(Bytes::from(pending.into_boxed_slice()));
+        }
+        Ok(parts)
+    }
+
+    fn append_parts(
+        mut emit: impl FnMut(Bytes),
+        pending: &mut Vec<u8>,
+        part_size: usize,
+        mut chunk: &[u8],
+    ) {
+        while !chunk.is_empty() {
+            if pending.capacity() == 0 {
+                pending.reserve_exact(part_size);
+            }
+            let n = (part_size - pending.len()).min(chunk.len());
+            pending.extend_from_slice(&chunk[..n]);
+            chunk = &chunk[n..];
+            if pending.len() == part_size {
+                emit(Bytes::from(std::mem::take(pending)));
+            }
+        }
     }
 
     /// Populate the parts cache from a just-uploaded object's bytes. Inserts
     /// are synchronous (foyer flushes to disk in the background), so this adds
     /// no I/O wait to the put.
     fn write_through(&self, location: &Path, payload: PutPayload) {
-        let chunks: Vec<Bytes> = payload.into_iter().collect();
-        let bytes = match chunks.len() {
-            0 => return,
-            1 => chunks.into_iter().next().expect("one chunk"),
-            _ => {
-                let mut buf = BytesMut::with_capacity(chunks.iter().map(Bytes::len).sum());
-                for c in &chunks {
-                    buf.extend_from_slice(c);
-                }
-                buf.freeze()
-            }
-        };
-        self.warm_object(location, bytes);
-    }
-
-    /// Warm the parts cache with an object's full bytes, sliced into
-    /// part-sized entries keyed as the read path expects.
-    fn warm_object(&self, location: &Path, bytes: Bytes) {
-        let ps = self.part_size_bytes;
-        let mut off = 0usize;
-        let mut part_id: PartId = 0;
-        while off < bytes.len() {
-            let end = (off + ps).min(bytes.len());
-            // Owned copy, not `bytes.slice(..)`: a slice keeps the whole
-            // source allocation (a 256 MiB sealed segment) alive while any
-            // one part survives in the cache, and the weigher only sees the
-            // slice length. That was the multi-GB RSS retention bug.
-            self.parts.insert(
-                PartKey::new(location, part_id),
-                Bytes::copy_from_slice(&bytes[off..end]),
+        let mut parts = Vec::new();
+        let mut pending = Vec::new();
+        for chunk in payload {
+            Self::append_parts(
+                |bytes| parts.push(bytes),
+                &mut pending,
+                self.part_size_bytes,
+                &chunk,
             );
-            off = end;
-            part_id += 1;
+        }
+        if !pending.is_empty() {
+            parts.push(Bytes::from(pending.into_boxed_slice()));
+        }
+        for (i, part) in parts.into_iter().enumerate() {
+            self.parts.insert(PartKey::new(location, i), part);
         }
     }
 
@@ -934,14 +950,10 @@ impl PrefetchingObjectStore {
             let leading = guard.is_some();
             let _guard = guard;
             match shared.await {
-                Ok((base, window)) => {
-                    let off = part_id.saturating_sub(base) * part_size_bytes;
-                    if off >= window.len() {
-                        // Window EOF-truncated short of this part.
+                Ok((base, parts)) => {
+                    let Some(part_bytes) = parts.get(part_id.saturating_sub(base)) else {
                         return Ok(Bytes::new());
-                    }
-                    let part_end = (off + part_size_bytes).min(window.len());
-                    let part_bytes = window.slice(off..part_end);
+                    };
                     let end = range_in_part.end.min(part_bytes.len());
                     let start = range_in_part.start.min(end);
                     Ok(part_bytes.slice(start..end))
@@ -980,18 +992,17 @@ impl PrefetchingObjectStore {
                 },
             )
             .await?;
-        let bytes = get_result.bytes().await?;
-        ctx.parts.insert(
-            PartKey::new(location, part_id),
-            Bytes::copy_from_slice(&bytes),
-        );
+        let parts = Self::collect_parts(get_result.into_stream(), part_size_bytes, 0).await?;
+        let bytes = parts.into_iter().next().unwrap_or_default();
+        ctx.parts
+            .insert(PartKey::new(location, part_id), bytes.clone());
         let end = range_in_part.end.min(bytes.len());
         let start = range_in_part.start.min(end);
         Ok(bytes.slice(start..end))
     }
 
     /// One GET spanning `window_parts` from `part_id`; caches every part and
-    /// resolves to `(part_id, window bytes)`. `access_offset` is the
+    /// resolves to `(part_id, owned parts)`. `access_offset` is the
     /// triggering request's start: the stream tracker keys on request
     /// offsets, so crediting the aligned window start instead would miss the
     /// stream on unaligned reads and the pipeline would never engage.
@@ -1001,7 +1012,7 @@ impl PrefetchingObjectStore {
         part_id: PartId,
         window_parts: usize,
         access_offset: u64,
-    ) -> Result<(PartId, Bytes), Arc<object_store::Error>> {
+    ) -> Result<FetchedParts, Arc<object_store::Error>> {
         let part_size_bytes = ctx.part_size_bytes;
         let fetch_start = part_id;
         let fetch_range = Range {
@@ -1022,7 +1033,9 @@ impl PrefetchingObjectStore {
         let meta = get_result.meta.clone();
         let attrs = get_result.attributes.clone();
         let actual_end = get_result.range.end;
-        let all_bytes = get_result.bytes().await.map_err(Arc::new)?;
+        let parts = Self::collect_parts(get_result.into_stream(), part_size_bytes, 0)
+            .await
+            .map_err(Arc::new)?;
 
         ctx.heads.insert(
             location.clone(),
@@ -1039,20 +1052,11 @@ impl PrefetchingObjectStore {
                 .unwrap()
                 .note_fetch(access_offset, actual_end);
         }
-        for i in 0..window_parts {
-            let start = i * part_size_bytes;
-            if start >= all_bytes.len() {
-                break;
-            }
-            let end = ((i + 1) * part_size_bytes).min(all_bytes.len());
-            // Owned copy: a slice would pin the whole window allocation for
-            // as long as any one part survives in the cache.
-            ctx.parts.insert(
-                PartKey::new(&location, fetch_start + i),
-                Bytes::copy_from_slice(&all_bytes[start..end]),
-            );
+        for (i, bytes) in parts.iter().enumerate() {
+            ctx.parts
+                .insert(PartKey::new(&location, fetch_start + i), bytes.clone());
         }
-        Ok((fetch_start, all_bytes))
+        Ok((fetch_start, parts.into()))
     }
 
     fn canonicalize_range(
@@ -1548,6 +1552,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_parts_are_cached_before_eof() {
+        let (store, _inner, _dir) = make_store(1024, MEM, DISK).await;
+        let path = Path::from("streamed-parts");
+        let skip = 300;
+        let body = Bytes::from(
+            (0..skip + 2560)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (tx, stream) = futures::channel::mpsc::unbounded();
+        let mut save = Box::pin(store.save_parts_stream(&path, stream, 7, skip));
+
+        // Skip across chunks, then cross two part boundaries while the stream
+        // stays open. Completed parts must already be available to readers.
+        for range in [0..100, 100..900, 900..2400] {
+            tx.unbounded_send(Ok(body.slice(range))).unwrap();
+        }
+        assert!(futures::poll!(&mut save).is_pending());
+        for (i, range) in [(0, skip..skip + 1024), (1, skip + 1024..skip + 2048)] {
+            let part = store
+                .cached_part(&path, 7 + i)
+                .await
+                .expect("completed part must be cached before EOF");
+            assert_eq!(part.as_ref(), &body[range]);
+        }
+        assert!(store.cached_part(&path, 9).await.is_none());
+
+        tx.unbounded_send(Ok(body.slice(2400..))).unwrap();
+        assert!(futures::poll!(&mut save).is_pending());
+        assert!(
+            store.cached_part(&path, 9).await.is_none(),
+            "the unfinished part must stay buffered until EOF"
+        );
+        drop(tx);
+        save.await.unwrap();
+        assert_eq!(
+            store.cached_part(&path, 9).await.unwrap().as_ref(),
+            &body[skip + 2048..]
+        );
+    }
+
+    #[tokio::test]
     async fn put_writes_through_to_parts_cache() {
         let (store, _inner, _dir) = make_store(1024, MEM, DISK).await;
         let path = Path::from("segments/3b/seg");
@@ -1574,7 +1620,7 @@ mod tests {
         // 2.5 parts: parts 0 and 1 full, part 2 partial (512). No object-store
         // put: exercise the cache-population helper directly.
         let body: Vec<u8> = (0..2560u32).map(|i| i as u8).collect();
-        store.warm_object(&path, body.clone().into());
+        store.write_through(&path, body.clone().into());
 
         for (part_id, range) in [(0usize, 0..1024usize), (1, 1024..2048), (2, 2048..2560)] {
             let entry = store
@@ -3019,7 +3065,7 @@ mod tests {
         let src = Bytes::from((0..2560u32).map(|i| i as u8).collect::<Vec<u8>>());
         let src_start = src.as_ptr() as usize;
         let src_end = src_start + src.len();
-        store.warm_object(&path, src.clone());
+        store.write_through(&path, src.clone().into());
 
         for part_id in 0..3 {
             let bytes = store.cached_part(&path, part_id).await.unwrap();

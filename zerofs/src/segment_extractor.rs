@@ -87,7 +87,7 @@ mod tests {
         let ex = ZeroFsSegmentExtractor;
         let codec = KeyCodec::new();
         assert_eq!(
-            ex.prefix_len(&PrefixTarget::Point(codec.inode_key(1))),
+            ex.prefix_len(&PrefixTarget::Point(codec.inode_key(1).into())),
             Some(META_DOMAIN.len())
         );
         assert_eq!(
@@ -95,7 +95,7 @@ mod tests {
             Some(META_DOMAIN.len())
         );
         assert_eq!(
-            ex.prefix_len(&PrefixTarget::Point(codec.extent_key(1, 0))),
+            ex.prefix_len(&PrefixTarget::Point(codec.extent_key(1, 0).into())),
             Some(EXTENT_DOMAIN.len())
         );
     }

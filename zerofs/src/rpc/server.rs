@@ -436,7 +436,7 @@ impl AdminService for AdminRpcServer {
         let interval_ms = request.into_inner().interval_ms.max(250) as u64;
         let fs_stats = Arc::clone(&self.fs.stats);
         let global_stats = Arc::clone(&self.fs.global_stats);
-        let seg_stats = self.fs.extent_store.segment_gc_stats();
+        let seg_stats = self.fs.extent_store.segment_reclaim_stats();
         let extent_store = self.fs.extent_store.clone();
         let max_bytes = self.fs.max_bytes;
         let stream = IntervalStream::new(tokio::time::interval(std::time::Duration::from_millis(
@@ -445,6 +445,7 @@ impl AdminService for AdminRpcServer {
         .map(move |_| {
             let (used_bytes, used_inodes) = global_stats.get_totals();
             let mem = JemallocMemStats::read();
+            let footprint = seg_stats.footprint();
             Ok(proto::StatsSnapshot {
                 timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
                 files_created: fs_stats.files_created.load(Ordering::Relaxed),
@@ -462,8 +463,10 @@ impl AdminService for AdminRpcServer {
                 bytes_written: fs_stats.bytes_written.load(Ordering::Relaxed),
                 tombstones_created: fs_stats.tombstones_created.load(Ordering::Relaxed),
                 tombstones_processed: fs_stats.tombstones_processed.load(Ordering::Relaxed),
-                gc_extents_deleted: fs_stats.gc_extents_deleted.load(Ordering::Relaxed),
-                gc_runs: fs_stats.gc_runs.load(Ordering::Relaxed),
+                tombstone_cleanup_extents_deleted: fs_stats
+                    .tombstone_cleanup_extents_deleted
+                    .load(Ordering::Relaxed),
+                tombstone_cleanup_runs: fs_stats.tombstone_cleanup_runs.load(Ordering::Relaxed),
                 total_operations: fs_stats.total_operations.load(Ordering::Relaxed),
                 used_bytes,
                 used_inodes,
@@ -473,32 +476,25 @@ impl AdminService for AdminRpcServer {
                 jemalloc_mapped: mem.mapped,
                 jemalloc_retained: mem.retained,
                 jemalloc_metadata: mem.metadata,
-                segment_gc: Some(proto::SegmentGcStatus {
-                    has_run: seg_stats.has_run.load(Ordering::Relaxed),
-                    segment_count: seg_stats.segment_count.load(Ordering::Relaxed),
-                    appended_bytes: seg_stats.appended_bytes.load(Ordering::Relaxed),
-                    live_bytes: seg_stats.live_bytes.load(Ordering::Relaxed),
-                    reclaimable_bytes: seg_stats.reclaimable_bytes.load(Ordering::Relaxed),
+                segment_reclaim: Some(proto::SegmentReclaimStatus {
+                    segment_count: footprint.segment_count,
+                    appended_bytes: footprint.appended_bytes,
+                    live_bytes: footprint.live_bytes,
+                    reclaimable_bytes: footprint.reclaimable_bytes,
                     awaiting_delete: seg_stats.awaiting_delete.load(Ordering::Relaxed),
                     awaiting_delete_bytes: seg_stats.awaiting_delete_bytes.load(Ordering::Relaxed),
-                    candidate_backlog: seg_stats.candidate_backlog.load(Ordering::Relaxed),
-                    chains_deferred: seg_stats.chains_deferred.load(Ordering::Relaxed),
-                    saturated: seg_stats.saturated.load(Ordering::Relaxed) != 0,
-                    last_deleted: seg_stats.last_deleted.load(Ordering::Relaxed),
-                    last_deleted_bytes: seg_stats.last_deleted_bytes.load(Ordering::Relaxed),
-                    last_frames_relocated: seg_stats.last_frames_relocated.load(Ordering::Relaxed),
-                    last_chains_packed: seg_stats.last_chains_packed.load(Ordering::Relaxed),
-                    last_chains_assembled: seg_stats.last_chains_assembled.load(Ordering::Relaxed),
-                    last_hot_seams: seg_stats.last_hot_seams.load(Ordering::Relaxed),
-                    pinned: seg_stats.pinned.load(Ordering::Relaxed),
-                    tier: seg_stats.tier.load(Ordering::Relaxed) as u32,
-                    read_directed: seg_stats.read_directed.load(Ordering::Relaxed),
-                    reason: seg_stats
-                        .reason
-                        .lock()
-                        .map(|r| r.clone())
-                        .unwrap_or_default(),
+                    checkpoint_pinned: seg_stats.checkpoint_pinned.load(Ordering::Relaxed),
                     unflushed_bytes: extent_store.unflushed_bytes(),
+                    active_repacks: seg_stats.active_repacks.load(Ordering::Relaxed),
+                    active_fetches: seg_stats.active_fetches.load(Ordering::Relaxed),
+                    active_puts: seg_stats.active_puts.load(Ordering::Relaxed),
+                    active_deletes: seg_stats.active_deletes.load(Ordering::Relaxed),
+                    repack_memory_reserved_bytes: seg_stats
+                        .repack_memory_reserved_bytes
+                        .load(Ordering::Relaxed),
+                    repack_memory_budget_bytes: seg_stats
+                        .repack_memory_budget_bytes
+                        .load(Ordering::Relaxed),
                 }),
             })
         });

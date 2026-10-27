@@ -88,7 +88,7 @@ The LSM tree stores metadata only; file bytes never enter it:
 |--------|----------|
 | Inodes, directory entries | File and directory metadata |
 | Extent pointers | One 32-byte pointer (FrameLoc) per extent: segment ID, frame index, byte range |
-| Segment counters | Live bytes per segment; input to garbage collection |
+| Segment counters | Live bytes per segment; input to segment reclamation |
 | Tombstones, orphans, statistics | Deferred deletion and accounting |
 
 The LSM tree also provides writer fencing (a monotonic writer epoch that doubles as the epoch in segment object keys) plus the manifest that anchors durability, checkpoints, and read replicas. Metadata becomes durable only through the flush barrier, which seals and uploads the open segment first. A durable manifest therefore never references a segment that is not in the object store.
@@ -103,7 +103,7 @@ One raw-parts cache (memory + disk, 128 KiB parts) sits below both planes and ho
 
 ### Space Reclamation
 
-Reclamation runs in-process on the writer. A segment GC pass runs every 60 seconds, or every 5 seconds while a saturated backlog meets an idle store. Each pass deletes segments with zero live bytes and repacks fragmented ones, re-sorting live extents by file and offset so they become physically contiguous. Metadata LSM compaction is embedded in `zerofs run` as well. See [Garbage Collection](/garbage-collection).
+The writer continuously reclaims segment space from durable counters with bounded parallelism. Metadata LSM compaction also runs inside `zerofs run`. See [Space Reclamation](/space-reclamation).
 
 ## Choosing a Protocol {{ id: 'choosing-a-protocol' }}
 

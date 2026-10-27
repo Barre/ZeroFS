@@ -253,7 +253,9 @@ impl NamespaceActor {
         let inode = self.model.inode_of(&path);
         let op = match self.rng.gen_range(0..10) {
             0..=6 => {
-                let len = self.rng.gen_range(0..=3 * EXTENT_SIZE);
+                // Include files above the ten-extent deferred-deletion threshold.
+                let cap = if self.rng.gen_bool(0.25) { 16 } else { 3 } * EXTENT_SIZE;
+                let len = self.rng.gen_range(0..=cap);
                 FileOp::Write {
                     offset: 0,
                     len,

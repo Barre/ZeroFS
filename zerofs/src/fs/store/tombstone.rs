@@ -6,7 +6,6 @@ use bytes::Bytes;
 use futures::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct TombstoneEntry {
@@ -27,10 +26,7 @@ impl TombstoneStore {
     }
 
     pub fn add(&self, txn: &mut Transaction, inode_id: InodeId, size: u64) {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let (timestamp, _) = crate::fs::get_current_time();
         let key = self.key_codec.tombstone_key(timestamp, inode_id);
         txn.put_bytes(&key, KeyCodec::encode_tombstone_size(size));
     }

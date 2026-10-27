@@ -8,12 +8,11 @@ use crate::data::{FileOp, FileOpMix, FileSnapshot, FileState, Region, pattern};
 use crate::digest::Digest;
 #[cfg(feature = "failpoints")]
 use crate::fp_crash;
-use crate::gc::gc_round;
 use crate::namespace::{NamespaceSnapshot, NsModel};
+use crate::reclamation::{reclamation_scans, tombstone_cleanup};
 use crate::sim::{SimClock, SimStore};
 use crate::{FILES, Scale, auth, creds, env_or, scale_for};
 use bytes::Bytes;
-use chrono::Utc;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjPath;
@@ -24,10 +23,16 @@ use slatedb::object_store::memory::InMemory;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use zerofs::db::SlateDbHandle;
 use zerofs::fs::inode::InodeId;
+use zerofs::fs::store::extent::reclaim::cycle;
 use zerofs::fs::types::{SetAttributes, SetSize};
 use zerofs::fs::{EXTENT_SIZE, ZeroFS};
+use zerofs::manifest_publication::{
+    COORDINATED_L0_SST_SIZE_BYTES, COORDINATED_MAX_UNFLUSHED_BYTES,
+};
+use zerofs::manifest_publication::{ManifestPublication, ManifestPublicationStore};
 
 const ORPHAN_DRAIN_GRACE: Duration = Duration::from_secs(30);
 const ORPHAN_DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -70,7 +75,7 @@ struct WorldConfig {
     failpoint_crashes: bool,
     rounds: usize,
     ops_per_file: usize,
-    gc_passes: usize,
+    reclamation_scans: usize,
     crash_pct: usize,
     fault_ppm: u32,
     scale: Scale,
@@ -90,7 +95,7 @@ impl WorldConfig {
             failpoint_crashes,
             rounds: env_or("DST_ROUNDS", 4),
             ops_per_file: env_or("DST_OPS", 50),
-            gc_passes: env_or("DST_GC", 6),
+            reclamation_scans: env_or("DST_RECLAIM", 6),
             crash_pct: env_or("DST_CRASH_PCT", 70).min(100),
             fault_ppm,
             scale: scale_for(seed),
@@ -106,7 +111,7 @@ impl WorldConfig {
         self.round_seed(round) ^ ((index as u64) << 4) ^ 1
     }
 
-    fn gc_seed(&self, round: usize) -> u64 {
+    fn reclamation_seed(&self, round: usize) -> u64 {
         self.round_seed(round) ^ 2
     }
 
@@ -163,19 +168,26 @@ impl Storage {
             Arc::new(zerofs::retrying_object_store::RetryingObjectStore::new(sim));
         let settings = slatedb::config::Settings {
             wal_enabled: false,
-            // Match production's barrier-controlled flush configuration while
-            // satisfying SlateDB's strict threshold ordering.
-            l0_sst_size_bytes: usize::MAX - 1,
-            max_unflushed_bytes: usize::MAX,
+            // Match production: prevent size-triggered memtable flushes and
+            // satisfy SlateDB's strict threshold ordering.
+            l0_sst_size_bytes: COORDINATED_L0_SST_SIZE_BYTES,
+            max_unflushed_bytes: COORDINATED_MAX_UNFLUSHED_BYTES,
             l0_max_ssts: 256,
             l0_max_ssts_per_key: 256,
             ..Default::default()
         };
+        let db_path = ObjPath::from("slatedb");
+        let manifest_publication = ManifestPublication::new();
+        let slatedb_object_store: Arc<dyn ObjectStore> = Arc::new(ManifestPublicationStore::new(
+            Arc::clone(&object_store),
+            db_path.clone(),
+            manifest_publication.clone(),
+        ));
         let slatedb = Arc::new(
-            DbBuilder::new(ObjPath::from("slatedb"), Arc::clone(&object_store))
+            DbBuilder::new(db_path, slatedb_object_store)
                 .with_settings(settings)
                 .with_seed(seed)
-                .with_system_clock(clock)
+                .with_system_clock(clock.clone())
                 .with_db_cache_disabled()
                 .with_filter_policies(zerofs::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(zerofs::segment_extractor::ZeroFsSegmentExtractor))
@@ -183,32 +195,28 @@ impl Storage {
                 .await
                 .expect("slatedb open"),
         );
-        let fs = Arc::new(
-            ZeroFS::try_new(
-                SlateDbHandle::ReadWrite(slatedb),
-                u64::MAX,
-                None,
-                false,
-                false,
-                None,
-                None,
-                Arc::new(zerofs::dedup::DedupCache::new()),
-                None,
-                zerofs::object_trace::ObjectTracer::new(),
-                object_store,
-                zerofs::frame_codec::FrameCodec::try_new(
-                    &[7u8; 32],
-                    zerofs::segment::SEGMENT_INFO,
-                    zerofs::config::CompressionConfig::default(),
-                )
-                .expect("test key should be lockable"),
-                Some(scale.seal_threshold),
-            )
-            .await
-            .expect("zerofs open"),
-        );
+        let fs = ZeroFS::try_new(
+            SlateDbHandle::ReadWrite(slatedb),
+            u64::MAX,
+            None,
+            false,
+            false,
+            None,
+            None,
+            Arc::new(zerofs::dedup::DedupCache::new()),
+            None,
+            zerofs::object_trace::ObjectTracer::new(),
+            object_store,
+            crate::segment_codec(),
+            Some(scale.seal_threshold),
+        )
+        .await
+        .expect("zerofs open");
+        fs.extent_store.set_reclaim_clock(clock);
+        fs.flush_coordinator
+            .set_manifest_publication(manifest_publication);
+        let fs = Arc::new(fs);
         fs.start_reclaim_drainer();
-        fs.extent_store.enable_nominations();
         fs
     }
 
@@ -600,12 +608,20 @@ impl WorldHarness {
                 self.actor_context(&fs, self.floors.file_slot(index), &trigger),
             )));
         }
-        let gc_handle = tokio::spawn(gc_round(
+        let reclamation_handle = tokio::spawn(reclamation_scans(
             fs.clone(),
-            StdRng::seed_from_u64(self.config.gc_seed(round)),
-            self.config.gc_passes,
+            StdRng::seed_from_u64(self.config.reclamation_seed(round)),
+            self.config.reclamation_scans,
             self.digest.clone(),
             trigger.receiver(),
+        ));
+        let maintenance_done = CancellationToken::new();
+        let cleanup_handle = tokio::spawn(tombstone_cleanup(
+            fs.clone(),
+            StdRng::seed_from_u64(self.config.round_seed(round) ^ 5),
+            self.digest.clone(),
+            trigger.receiver(),
+            maintenance_done.clone(),
         ));
         let namespace_handle = tokio::spawn(namespace.run_round(
             StdRng::seed_from_u64(self.config.namespace_seed(round)),
@@ -625,12 +641,14 @@ impl WorldHarness {
         for handle in file_handles {
             files.push(handle.await.expect("writer actor"));
         }
-        gc_handle.await.expect("gc actor");
+        reclamation_handle.await.expect("reclamation actor");
         let namespace = namespace_handle.await.expect("ns actor");
         let mut regions = Vec::with_capacity(region_handles.len());
         for handle in region_handles {
             regions.push(handle.await.expect("region actor"));
         }
+        maintenance_done.cancel();
+        cleanup_handle.await.expect("tombstone cleanup actor");
 
         RoundOutcome {
             model: WorldModel {
@@ -651,6 +669,10 @@ impl WorldHarness {
                 self.config.seed
             )
         });
+        crate::reclamation::cleaner(fs)
+            .run()
+            .await
+            .expect("final tombstone cleanup");
 
         for file in &model.files {
             assert_eq!(
@@ -729,8 +751,20 @@ impl WorldHarness {
         self.digest.event(("crashed", round));
         let fs = self.storage.fs().clone();
 
-        fs.extent_store
-            .sweep_orphans(Utc::now() + chrono::Duration::days(1))
+        crate::checks::verify_referenced_segments(
+            &fs,
+            Arc::clone(&self.storage.backing),
+            self.config.seed,
+            round,
+        )
+        .await;
+
+        crate::reclamation::cleaner(&fs)
+            .run()
+            .await
+            .expect("recovered tombstone cleanup");
+
+        cycle::sweep_orphans(&fs.extent_store, &CancellationToken::new())
             .await
             .expect("orphan sweep");
         let report = verify_consistency_sparse(&fs)
@@ -788,6 +822,9 @@ pub(crate) fn run_seed(seed: u64) -> (u64, Vec<String>) {
     run_seed_mode(seed, false)
 }
 
+#[path = "reclamation_cases.rs"]
+mod reclamation_cases;
+
 /// Cover an acknowledged write after the last ordinary flush, then race a write
 /// against close. An acknowledged write must survive; a rejected one must not.
 pub(crate) fn run_graceful_close_case(seed: u64) {
@@ -806,7 +843,7 @@ pub(crate) fn run_graceful_close_case(seed: u64) {
             failpoint_crashes: false,
             rounds: 0,
             ops_per_file: 0,
-            gc_passes: 0,
+            reclamation_scans: 0,
             crash_pct: 0,
             fault_ppm: 0,
             scale: scale_for(seed),
@@ -951,7 +988,7 @@ mod tests {
                 failpoint_crashes: false,
                 rounds: 0,
                 ops_per_file: 0,
-                gc_passes: 0,
+                reclamation_scans: 0,
                 crash_pct: 0,
                 fault_ppm: 0,
                 scale: scale_for(seed),

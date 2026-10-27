@@ -108,7 +108,7 @@ impl ZeroFS {
         };
 
         let root_inode_key = key_codec.inode_key(0);
-        if db.get_bytes(&root_inode_key).await?.is_none() {
+        if db.get_bytes(root_inode_key.as_ref()).await?.is_none() {
             if db.is_read_only() {
                 return Err(anyhow::anyhow!(
                     "Cannot initialize filesystem in read-only mode. Root inode does not exist."
@@ -134,7 +134,7 @@ impl ZeroFS {
             };
             let serialized = bincode::serialize(&Inode::Directory(root_dir))?;
             db.put_with_options(
-                &root_inode_key,
+                &root_inode_key.into(),
                 &serialized,
                 &PutOptions::default(),
                 &WriteOptions::default(),
@@ -155,6 +155,15 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
         let stats = Arc::new(FileSystemStats::new());
+        let directory_store = DirectoryStore::new(db.clone(), key_codec.clone());
+        let inode_store = InodeStore::new(db.clone(), key_codec.clone(), next_inode_id);
+        let tombstone_store = TombstoneStore::new(db.clone(), key_codec.clone());
+        let orphan_store = OrphanStore::new(db.clone(), key_codec.clone());
+
+        // Allocate the queue before ExtentStore so it can hold a weak sender
+        // without keeping its own commit worker alive.
+        let (write_coordinator, pending_write_coordinator) =
+            WriteCoordinator::channel(next_inode_id);
         let segment_store = Arc::new(SegmentStore::new(object_store, segment_codec, writer_epoch));
         let extent_store = ExtentStore::new(
             db.clone(),
@@ -162,13 +171,12 @@ impl ZeroFS {
             segment_store,
             lock_manager.clone(),
             seal_threshold_override.unwrap_or(crate::fs::store::extent::SEAL_THRESHOLD),
+            write_coordinator.downgrade(),
         );
-        // Seed the monitor's segment footprint gauges from the existing on-store
-        // segments before any write; from here they are maintained incrementally
-        // off the commit path, so the panel never scans to stay current.
+        // Seed footprint gauges before the commit worker starts updating them.
         extent_store.seed_footprint().await?;
-        // The flush path seals the open data-plane segment before flushing the
-        // manifest, so a durable manifest never references an un-PUT segment.
+        // A flush blocks SlateDB's manifest PUT until this hook has PUT the open
+        // ZeroFS segment.
         flush_coordinator.set_sealer({
             let es = extent_store.clone();
             Arc::new(move || {
@@ -176,14 +184,9 @@ impl ZeroFS {
                 Box::pin(async move { es.seal_open().await })
             })
         });
-        let directory_store = DirectoryStore::new(db.clone(), key_codec.clone());
-        let inode_store = InodeStore::new(db.clone(), key_codec.clone(), next_inode_id);
-        let tombstone_store = TombstoneStore::new(db.clone(), key_codec.clone());
-        let orphan_store = OrphanStore::new(db.clone(), key_codec.clone());
-
         // Carry the durability lineage only across a coverage-proven, untainted
-        // takeover; otherwise regenerate it. This must precede the WriteCoordinator,
-        // which records any later Solo taint.
+        // takeover; otherwise regenerate it. This must precede starting the
+        // commit worker, which records any later Solo taint.
         let lineage_token = match raw_writer {
             Some(raw_writer) => {
                 Self::resolve_lineage_token(
@@ -198,7 +201,7 @@ impl ZeroFS {
             None => 0,
         };
 
-        let write_coordinator = WriteCoordinator::new(
+        pending_write_coordinator.start(
             db.clone(),
             inode_store.clone(),
             directory_store.clone(),
@@ -211,10 +214,6 @@ impl ZeroFS {
             lineage_token,
             extent_store.clone(),
         );
-
-        // Route the data plane's GC/compaction seg-count txns through the single
-        // commit worker (its sole writer). Weak, so it can't keep the worker alive.
-        extent_store.set_coordinator(write_coordinator.downgrade());
 
         let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::unbounded_channel();
         dedup.set_reclaim_sender(&reclaim_tx);

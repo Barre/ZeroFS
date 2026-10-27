@@ -14,6 +14,7 @@ use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
     AuthContext, FileAttributes, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
 };
+use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{ZeroFS, get_current_time, validate_filename};
 use ::tracing::debug;
 use std::sync::atomic::Ordering;
@@ -56,7 +57,7 @@ impl ZeroFS {
             target
         );
 
-        let _guard = self.lock_manager.acquire(dirid).await;
+        let inode_guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_symlink)? {
             return Ok(result);
@@ -170,7 +171,8 @@ impl ZeroFS {
 
         txn.add_stats_delta(new_id, 0, 1);
 
-        self.write_coordinator.commit(txn).await?;
+        let mutation = LockedMutation::new(txn, inode_guard);
+        self.write_coordinator.commit_locked(mutation).await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::SYMLINK_AFTER_COMMIT);
@@ -227,7 +229,7 @@ impl ZeroFS {
             fileid, linkdirid, linkname_str
         );
 
-        let _guards = self
+        let inode_guards = self
             .lock_manager
             .acquire_multi(vec![fileid, linkdirid])
             .await;
@@ -395,7 +397,8 @@ impl ZeroFS {
                 .ok();
         }
 
-        self.write_coordinator.commit(txn).await?;
+        let mutation = LockedMutation::new(txn, inode_guards);
+        self.write_coordinator.commit_locked(mutation).await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::LINK_AFTER_COMMIT);

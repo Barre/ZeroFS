@@ -21,8 +21,6 @@ use fuser::{
     SessionACL, TimeOrNow,
 };
 use ninep_client::{ClientError, NinePClient, ReaddirState, SetattrBuilder, SetattrTime, Target};
-#[cfg(test)]
-use ninep_proto::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
 use ninep_proto::{
     GETATTR_ALL, LockStatus, LockType, P9_LOCK_FLAGS_BLOCK, Stat, classify_fallocate_mode,
 };
@@ -1242,7 +1240,7 @@ impl Filesystem for Fuse9P {
                     // except "." and ".."; account for it like `resolve_child` so a
                     // later forget balances. The fid stays unbound (bound lazily by
                     // `user_fid` via Trebind on the first real op).
-                    if !matches!(e.name.data.as_slice(), b"." | b"..") {
+                    if !matches!(e.name.as_ref(), b"." | b"..") {
                         inodes.entry(child_ino).or_default().lookup += 1;
                     }
                 }
@@ -2008,6 +2006,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
 #[cfg(test)]
 mod consistency_tests {
     use super::*;
+    use ninep_proto::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
 
     #[test]
     fn open_flags_precedence() {
@@ -3398,7 +3397,7 @@ mod client_tests {
         let entries = c2.readdir(df, 0, 8192).await.unwrap();
         let dotdot = entries
             .iter()
-            .find(|e| e.name.data.as_slice() == b"..")
+            .find(|e| e.name.as_ref() == b"..")
             .expect("readdir returned no .. entry");
         assert_eq!(
             dotdot.qid.path, vol_qid.path,

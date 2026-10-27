@@ -6,14 +6,11 @@
 //! speak the exact same messages. Includes the ZeroFS-private `Trebind`/`Rrebind`
 //! reconnect extension.
 //!
-//! The default API uses Deku with `Vec`/`Bytes` ownership. [`slice_codec`]
-//! encodes into caller-owned buffers and decodes borrowed response views
-//! without allocation. Both codecs share message identifiers, limits, fixed
-//! structures, and storage-neutral [`WireString`]/[`WireBytes`] values. With
-//! default features disabled, the slice codec and shared wire layer
-//! require only `core`. Enabling `owned` adds the Deku API in `no_std + alloc`
-//! environments; the default `std` feature enables its standard-library I/O
-//! adapters.
+//! All supported messages use [`slice_codec`]. It encodes into caller-owned
+//! buffers and decodes borrowed views without allocating. The owned API uses
+//! `Bytes` storage, so decoded strings and payloads share the received frame.
+//! With default features disabled, the codec requires only `core`. The `owned`
+//! feature adds the userspace API in `no_std + alloc` environments.
 
 #[cfg(feature = "owned")]
 extern crate alloc;
@@ -21,18 +18,15 @@ extern crate alloc;
 extern crate std;
 
 #[cfg(feature = "owned")]
-mod deku_bytes;
-#[cfg(feature = "owned")]
 mod lock_range;
 #[cfg(feature = "owned")]
 mod protocol;
 pub mod retry;
 pub mod slice_codec;
-mod wire_requests;
+mod wire_messages;
+pub use slice_codec::{CodecError, LockType};
 mod wire_types;
 
-#[cfg(feature = "owned")]
-pub use deku_bytes::*;
 #[cfg(feature = "owned")]
 pub use lock_range::*;
 #[cfg(feature = "owned")]

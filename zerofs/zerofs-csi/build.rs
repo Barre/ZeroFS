@@ -27,9 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(&["proto/csi.proto"], &["proto/"])?;
 
-    // The ZeroFS admin proto, vendored from ../proto/admin.proto. The zerofs
-    // crate does not export its generated client from the library, so the CSI
-    // driver generates its own (client only).
+    // The CSI driver needs only the directory-management subset of the ZeroFS
+    // admin service, so it generates a minimal client schema.
     tonic_prost_build::configure()
         .build_server(false)
         .build_client(true)

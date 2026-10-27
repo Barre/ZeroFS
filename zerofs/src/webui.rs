@@ -2,6 +2,7 @@ use crate::config::WebUIConfig;
 use crate::fs::ZeroFS;
 use crate::ninep::handler::{NinePHandler, SessionReleaseGuard};
 use crate::ninep::lock_manager::FileLockManager;
+use crate::ninep::response::EncodedResponse;
 use crate::ninep::server::{InflightRegistry, dispatch_9p_frame, response_may_be_emitted};
 use crate::rpc::proto;
 use crate::rpc::server::AdminRpcServer;
@@ -11,6 +12,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use bytes::Buf;
 use ninep_proto::P9_CHANNEL_SIZE;
 use rust_embed::Embed;
 use std::sync::Arc;
@@ -57,7 +59,7 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState, _drain_guard: TaskTrac
     let mut release_guard = SessionReleaseGuard::new(Arc::clone(&handler));
     let inflight = InflightRegistry::default();
 
-    let (tx, mut rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
+    let (tx, mut rx) = mpsc::channel::<(u16, EncodedResponse)>(P9_CHANNEL_SIZE);
 
     // Writer task: sends response bytes as WS binary messages
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -67,7 +69,8 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState, _drain_guard: TaskTrac
     // Abort on early exit; normal teardown drains responses for a bounded interval.
     let mut writer = AbortOnDropHandle::new(spawn_named("9p-ws-writer", async move {
         use futures::SinkExt;
-        while let Some((tag, response_bytes)) = rx.recv().await {
+        while let Some((tag, mut response_bytes)) = rx.recv().await {
+            let response_bytes = response_bytes.copy_to_bytes(response_bytes.remaining());
             if !response_may_be_emitted(&response_db, &response_bytes) {
                 warn!(
                     "Dropping successful WebSocket 9P response for tag {tag} after serving \
@@ -76,11 +79,7 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState, _drain_guard: TaskTrac
                 writer_authority_lost.cancel();
                 break;
             }
-            if ws_tx
-                .send(WsMessage::Binary(response_bytes.into()))
-                .await
-                .is_err()
-            {
+            if ws_tx.send(WsMessage::Binary(response_bytes)).await.is_err() {
                 break;
             }
         }

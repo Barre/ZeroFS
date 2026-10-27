@@ -60,9 +60,9 @@ use mount::{
     zerofs_umount_begin,
 };
 use namespace::{
-    zerofs_atomic_open, zerofs_create, zerofs_get_link, zerofs_getattr, zerofs_link, zerofs_lookup,
-    zerofs_mkdir, zerofs_mknod, zerofs_permission, zerofs_rename, zerofs_rmdir, zerofs_setattr,
-    zerofs_symlink, zerofs_unlink,
+    zerofs_atomic_open, zerofs_get_link, zerofs_getattr, zerofs_link, zerofs_lookup, zerofs_mkdir,
+    zerofs_mknod, zerofs_permission, zerofs_rename, zerofs_rmdir, zerofs_setattr, zerofs_symlink,
+    zerofs_unlink,
 };
 pub(crate) use netfs_ops::{run_netfs_read_subrequest, run_netfs_write_subrequest};
 use netfs_ops::{
@@ -1588,7 +1588,7 @@ pub(crate) fn initialize(module: &'static ThisModule) -> Result<()> {
         atomic_open: Some(zerofs_atomic_open),
         getattr: Some(zerofs_getattr),
         setattr: Some(zerofs_setattr),
-        create: Some(zerofs_create),
+        create: Some(compat::CreateCallback::CALLBACK),
         link: Some(zerofs_link),
         unlink: Some(zerofs_unlink),
         symlink: Some(zerofs_symlink),

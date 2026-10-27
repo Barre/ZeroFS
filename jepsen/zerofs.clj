@@ -22,7 +22,7 @@
         work (str dir ".zerofs")]
     {:mount      dir
      :work       work
-     ; A fresh MinIO prefix per run isolates trials (MinIO has no per-run wipe,
+     ; A fresh SeaweedFS prefix per run isolates trials (SeaweedFS has no per-run wipe,
      ; unlike the old file:// store that teardown's rm -rf cleaned).
      :store      (str "s3://zerofs-jepsen/run-" (java.util.UUID/randomUUID))
      :cache      (str work "/cache")
@@ -46,8 +46,8 @@
        "\n"
        "[aws]\n"
        "endpoint = \"http://127.0.0.1:9000\"\n"
-       "access_key_id = \"minioadmin\"\n"
-       "secret_access_key = \"minioadmin\"\n"
+       "access_key_id = \"zerofsadmin\"\n"
+       "secret_access_key = \"zerofsadmin\"\n"
        "allow_http = \"true\"\n"
        "\n"
        "[servers.ninep]\n"

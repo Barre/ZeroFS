@@ -1,7 +1,7 @@
 (ns zerofs-ha.core
-  "Jepsen HA test for ZeroFS: local MinIO + a ZeroFS leader/standby pair over it +
+  "Jepsen HA test for ZeroFS: local SeaweedFS + a ZeroFS leader/standby pair over it +
   a multi-target FUSE or native-kernel mount. Nemesis kills
-  leader/standby/both/MinIO then heals.
+  leader/standby/both/SeaweedFS then heals.
   Workload is a grow-only set (add = create+fsync a uniquely-named file, fsync
   being a global durability barrier; read = ls); set-full checker asserts no
   acked add is lost. All-local: one logical node, dummy SSH, process management
@@ -21,7 +21,8 @@
                     [tests :as tests]
                     [util :as util :refer [await-fn]]]
             [jepsen.os :as os]
-            [slingshot.slingshot :refer [try+ throw+]])
+            [slingshot.slingshot :refer [try+ throw+]]
+            [zerofs-ha.ninep :as ninep])
   (:import [java.net StandardProtocolFamily UnixDomainSocketAddress]
            [java.nio.channels SocketChannel]
            [java.util BitSet])
@@ -50,17 +51,16 @@
   (let [work (:work-dir opts)]
     {:work        work
      :zerofs      (:zerofs-bin opts)
-     :minio       (:minio-bin opts)
-     :mc          (:mc-bin opts)
+     :weed        (:weed-bin opts)
      :mount       (str work "/mnt")
      :mount-client (or (:mount-client opts) "fuse")
-     :minio-data  (str work "/minio-data")
-     :minio-addr  "127.0.0.1:9000"
-     :minio-log   (str work "/minio.log")
-     :minio-pid   (str work "/minio.pid")
+     :store-data  (str work "/store-data")
+     :s3-addr     "127.0.0.1:9000"
+     :store-log   (str work "/seaweedfs.log")
+     :store-pid   (str work "/seaweedfs.pid")
      :bucket      "zerofs-jepsen"
-     :access-key  "minioadmin"
-     :secret-key  "minioadmin"
+     :access-key  "zerofsadmin"
+     :secret-key  "zerofsadmin"
      :password    "jepsen-ha"
      ;; Symmetric replication: each node listens on its repl-port and ships to a
      ;; RELAY (peer-port) that forwards to the peer's repl-port, so the partition
@@ -114,7 +114,7 @@
 ;; The leader<->standby replication (ship, heartbeat, Hello) all dial one TCP
 ;; port, so routing it through a relay we control and cutting the relay is a true
 ;; partition: both nodes stay up, keep serving clients (unix sockets) and reach
-;; MinIO, but cannot reach each other. A transparent byte-pump, so gRPC passes.
+;; SeaweedFS, but cannot reach each other. A transparent byte-pump, so gRPC passes.
 
 (defn close-quietly! [^java.io.Closeable s] (try (.close s) (catch Exception _ nil)))
 
@@ -171,29 +171,34 @@
 ;; Started in setup!: {:to-b <relay> :to-a <relay>}; the nemesis cuts/heals them.
 (def relays (atom nil))
 
-(defn minio-up? [c]
-  (zero? (:exit (sh! :curl :-fsS (str "http://" (:minio-addr c) "/minio/health/live")))))
+(defn bucket-probe [c]
+  ;; Signed HEAD checks both S3 authentication and the bucket created by mini.
+  [:curl :-fsSI :--connect-timeout 1 :--max-time 2
+   :--aws-sigv4 "aws:amz:us-east-1:s3"
+   :--user (str (:access-key c) ":" (:secret-key c))
+   (str "http://" (:s3-addr c) "/" (:bucket c))])
 
-(defn start-minio! [c]
-  (info "Starting MinIO")
-  (daemon-start! (:minio-pid c) (:minio-log c)
-                 {"MINIO_ROOT_USER" (:access-key c)
-                  "MINIO_ROOT_PASSWORD" (:secret-key c)}
-                 (:minio c)
-                 ["server" (:minio-data c) "--address" (:minio-addr c)
-                  "--console-address" "127.0.0.1:9001"])
-  (await-fn (fn [] (or (minio-up? c) (throw+ {:type ::minio-down})))
-            {:retry-interval 200 :log-interval 5000 :log-message "Waiting for MinIO"}))
+(defn store-up? [c]
+  (zero? (:exit (apply sh! (bucket-probe c)))))
 
-(defn make-bucket! [c]
-  ;; The liveness endpoint can precede S3 readiness. Require alias setup,
-  ;; idempotent creation, and a successful bucket stat before starting ZeroFS.
-  (await-fn (fn []
-              (sh-ok! (:mc c) "alias" "set" "j" (str "http://" (:minio-addr c))
-                      (:access-key c) (:secret-key c))
-              (sh-ok! (:mc c) "mb" "--ignore-existing" (str "j/" (:bucket c)))
-              (sh-ok! (:mc c) "stat" (str "j/" (:bucket c))))
-            {:retry-interval 200 :log-interval 5000 :log-message "Waiting for MinIO bucket"}))
+(defn await-bucket! [c]
+  ;; mini pre-creates the bucket. Do not start ZeroFS until S3 can read it.
+  (await-fn (fn [] (apply sh-ok! (bucket-probe c)))
+            {:timeout 120000 :retry-interval 200 :log-interval 5000
+             :log-message "Waiting for SeaweedFS bucket"}))
+
+(defn start-store! [c]
+  (info "Starting SeaweedFS")
+  (daemon-start! (:store-pid c) (:store-log c)
+                 {"AWS_ACCESS_KEY_ID" (:access-key c)
+                  "AWS_SECRET_ACCESS_KEY" (:secret-key c)}
+                 (:weed c)
+                 ["mini" (str "-dir=" (:store-data c))
+                  "-ip=127.0.0.1" "-ip.bind=127.0.0.1" "-s3.port=9000"
+                  "-admin.ui=false" "-webdav=false"
+                  "-s3.port.iceberg=0" "-s3.port.lance=0"
+                  "-master.volumeSizeLimitMB=128" (str "-bucket=" (:bucket c))])
+  (await-bucket! c))
 
 (defn node-cfg-str
   ([c node-key role] (node-cfg-str c node-key role false))
@@ -219,7 +224,7 @@
           "[aws]\n"
           "access_key_id = \"" (:access-key c) "\"\n"
           "secret_access_key = \"" (:secret-key c) "\"\n"
-          "endpoint = \"http://" (:minio-addr c) "\"\n"
+          "endpoint = \"http://" (:s3-addr c) "\"\n"
           "region = \"us-east-1\"\n"
           "allow_http = \"true\"\n"
           "conditional_put = \"etag\"\n\n"
@@ -245,6 +250,19 @@
                  (get-in c [:nodes node-key :ninep]))))
     true
     (catch Exception _ false)))
+
+(defn node-replication-up? [c node-key]
+  (try
+    (with-open [socket (java.net.Socket.)]
+      (.connect socket
+                (java.net.InetSocketAddress. "127.0.0.1"
+                                             (int (get-in c [:nodes node-key :repl-port])))
+                200))
+    true
+    (catch Exception _ false)))
+
+(defn node-writer-epoch [c node-key]
+  (ninep/writer-epoch (get-in c [:nodes node-key :ninep])))
 
 (defn standby-ready-count [c node-key]
   (try
@@ -306,7 +324,7 @@
   (kill-pid! (str (:work c) "/mount.pid"))
   (kill-pid! (get-in c [:nodes :a :pid]))
   (kill-pid! (get-in c [:nodes :b :pid]))
-  (kill-pid! (:minio-pid c)))
+  (kill-pid! (:store-pid c)))
 
 ;; Live role tracking; the nemesis updates it as it kills/heals so :kill-leader
 ;; always targets the *current* leader (roles swap after a rejoin-as-standby).
@@ -327,21 +345,29 @@
         (info "Setting up ZeroFS HA cluster")
         (cluster-down! c)
         (Thread/sleep 1000)
-        (sh! :bash :-c (str "rm -rf " (:minio-data c) " " (get-in c [:nodes :a :cache])
+        (sh! :bash :-c (str "rm -rf " (:store-data c) " " (get-in c [:nodes :a :cache])
                             " " (get-in c [:nodes :b :cache]) " " (:work c) "/*.log "
                             (:work c) "/*.sock"))
-        (sh! :mkdir :-p (:minio-data c) (get-in c [:nodes :a :cache])
+        (sh! :mkdir :-p (:store-data c) (get-in c [:nodes :a :cache])
              (get-in c [:nodes :b :cache]) (:mount c))
-        (start-minio! c)
-        (make-bucket! c)
+        (start-store! c)
         (let [rs (:relays c)]
           (reset! relays
                   {:to-b (start-relay! (get-in rs [:to-b :listen]) (get-in rs [:to-b :target]))
                    :to-a (start-relay! (get-in rs [:to-a :listen]) (get-in rs [:to-a :target]))}))
-        (start-node! c :a "leader")
-        (await-fn (fn [] (or (node-9p-up? c :a) (throw+ {:type ::leader-down})))
-                  {:retry-interval 200 :log-interval 5000 :log-message "Waiting for leader 9P"})
-        (start-standby! c :b)
+        (let [standby-base (standby-ready-count c :b)]
+          (start-node! c :b "standby")
+          ;; Background writes start with the leader and can taint its lineage
+          ;; if replication is unavailable. Wait for the standby's receiver,
+          ;; not its elected role: role election needs the leader's Hello.
+          (await-fn (fn [] (or (node-replication-up? c :b)
+                              (throw+ {:type ::standby-receiver-down})))
+                    {:retry-interval 200 :log-interval 5000 :timeout 120000
+                     :log-message "Waiting for standby replication listener"})
+          (start-node! c :a "leader")
+          (await-fn (fn [] (or (node-9p-up? c :a) (throw+ {:type ::leader-down})))
+                    {:retry-interval 200 :log-interval 5000 :log-message "Waiting for leader 9P"})
+          (await-standby-ready! c :b standby-base))
         (mount! c)
         (reset! cluster-roles {:a :leader :b :standby})
         (info "ZeroFS HA cluster ready")))
@@ -634,7 +660,7 @@
 ;; that fid's writes, not a global barrier), so durability honesty is tested by
 ;; holding files OPEN and fsyncing each by name. Ops carry :file so the checker
 ;; matches a write to the fsync that covers it. `handles` is a shared
-;; name->RandomAccessFile map (the deterministic scenarios run one logical thread).
+;; name->RandomAccessFile map used by every Jepsen worker.
 
 (defn dc-file [dir f] (io/file dir f))
 
@@ -678,16 +704,23 @@
           ;; seek+write to the same offset (test artifact, not durability).
           :write (let [v (swap! counter inc)
                        {:keys [raf file]} (get @handles hkey)]
-                   (locking raf
-                     (.seek raf (.length raf))
-                     (.write raf (.getBytes (str v "\n"))))
-                   (assoc op :type :ok :value v :file file))
+                   (try
+                     (locking raf
+                       (.seek raf (.length raf))
+                       (.write raf (.getBytes (str v "\n"))))
+                     (assoc op :type :ok :value v :file file)
+                     (catch java.io.IOException e
+                       (assoc op :type :info :value v :file file :error (.getMessage e)))))
           ;; ftruncate(fd) to a size: metadata-only change on the open fd (no data
           ;; write). Via FUSE this is a setattr, which the mount lands on the per-inode
           ;; fid, NOT this open handle.
           :truncate (let [{:keys [raf file]} (get @handles hkey)]
-                      (locking raf (.setLength raf (long (:to op))))
-                      (assoc op :type :ok :value (:to op) :file file))
+                      (try
+                        (locking raf (.setLength raf (long (:to op))))
+                        (assoc op :type :ok :value (:to op) :file file)
+                        (catch java.io.IOException e
+                          (assoc op :type :info :value (:to op) :file file
+                                 :error (.getMessage e)))))
           ;; fsync this handle's fd. :fail surfaces an ESTALE honestly. The result
           ;; carries the underlying :file so the checker pairs it with writes to that
           ;; file made through ANY handle.
@@ -750,30 +783,41 @@
                                                              (or (.listFiles (dc-file dir dirname))
                                                                  (into-array java.io.File []))))])))))))
   (teardown! [_ _test] (close-durability-handles! handles))
-  (close! [_ _test] (close-durability-handles! handles)))
+  ;; A worker owns no individual handles. Only test teardown may close the map.
+  (close! [_ _test])
+  client/Reusable
+  (reusable? [_ _test] true))
 
 ;; Nemesis: process loss, object-store pauses, replication partitions, blocked
 ;; survivor restart, solo recovery, and cluster repair.
 
 (defn heal-restart!
-  "Clean full restart to canonical leader=:a, standby=:b. Works from any state
-  (incl. kill-both); the multi-target client re-routes."
+  "Restart both nodes and discover the elected leader/standby roles. Works from
+  any state (incl. kill-both); the multi-target client re-routes."
   [c]
-  (when-not (minio-up? c) (start-minio! c))
+  (when-not (store-up? c) (start-store! c))
   (kill-pid! (node-pid c :a))
   (kill-pid! (node-pid c :b))
   (Thread/sleep 1000)
-  (let [standby-base (standby-ready-count c :b)]
+  (let [standby-bases (into {} (for [node [:a :b]]
+                               [node (standby-ready-count c node)]))]
     ;; Start both receivers before waiting; the recorded latest writer may block
     ;; until its peer answers Hello.
     (start-node! c :b "standby")
     (start-node! c :a "leader")
-    (await-fn (fn [] (or (node-9p-up? c :a) (throw+ {:type ::leader-down})))
-              {:retry-interval 200 :log-interval 5000 :log-message "heal: waiting for leader"})
-    (await-standby-ready! c :b standby-base))
-  (await-fn (fn [] (or (mounted? c) (throw+ {:type ::not-mounted})))
-            {:retry-interval 500 :log-interval 5000 :log-message "heal: waiting for mount"})
-  (reset! cluster-roles {:a :leader :b :standby}))
+    ;; Configured roles do not override the durable election. Either node can
+    ;; become the writer, and a listening socket alone does not prove authority.
+    (let [leader (await-fn
+                  (fn [] (or (some #(when (node-writer-epoch c %) %) [:a :b])
+                             (throw+ {:type ::leader-down})))
+                  {:retry-interval 200 :log-interval 5000
+                   :log-message "heal: waiting for elected leader"})
+          standby (if (= :a leader) :b :a)]
+      (await-standby-ready! c standby (get standby-bases standby))
+      (await-fn (fn [] (or (mounted? c) (throw+ {:type ::not-mounted})))
+                {:retry-interval 500 :log-interval 5000 :log-message "heal: waiting for mount"})
+      (info "heal: elected leader" leader "with standby" standby)
+      (reset! cluster-roles {leader :leader standby :standby}))))
 
 (defn heal-rejoin!
   "Heal with no outage: bring the dead node back as STANDBY under the live leader
@@ -789,118 +833,138 @@
           (swap! cluster-roles assoc dead :standby))
       (heal-restart! c))))
 
-(defn ha-nemesis []
-  (reify nemesis/Nemesis
-    (setup! [this _test] this)
-    (invoke! [_ test op]
-      (let [c (cfg test)]
-        (assoc op :value
-               (case (:f op)
-                 :kill-leader  (let [n (leader-node) s (standby-node)]
-                                 (kill-pid! (node-pid c n))
-                                 (swap! cluster-roles assoc n :dead)
-                                 (when s (swap! cluster-roles assoc s :leader))
-                                 (str "killed-leader-" (name n)))
-                 :kill-standby (let [n (standby-node)]
-                                 (kill-pid! (node-pid c n))
-                                 (swap! cluster-roles assoc n :dead)
-                                 (str "killed-standby-" (name n)))
-                 :kill-both    (do (kill-pid! (node-pid c :a))
-                                   (kill-pid! (node-pid c :b))
-                                   (reset! cluster-roles {:a :dead :b :dead})
-                                   :killed-both)
-                 :pause-minio  (do (pause-pid! (:minio-pid c)) :paused-minio)
-                 :resume-minio (do (resume-pid! (:minio-pid c))
-                                   ;; Restart ZeroFS after store recovery.
-                                   (Thread/sleep 500)
-                                   (heal-restart! c)
-                                   :resumed-minio)
-                 :await-serving (do (await-fn
-                                     (fn [] (or (node-9p-up? c :a)
-                                                (node-9p-up? c :b)
-                                                (throw+ {:type ::no-serving-node})))
-                                     {:retry-interval 500 :log-interval 5000 :timeout 40000
-                                      :log-message "failover: waiting for an authoritative listener"})
-                                    :serving)
-                 ;; Hold the leader through failure detection and claim grace.
-                 :pause-leader  (let [n (leader-node) s (standby-node)]
-                                  (pause-pid! (node-pid c n))
-                                  (swap! cluster-roles assoc n :paused)
-                                  (when s (swap! cluster-roles assoc s :leader))
-                                  (str "paused-leader-" (name n)))
-                 :resume-leader (let [p (paused-node) ldr (leader-node)]
-                                  (if (and p ldr (not= p ldr))
-                                    (do (info "resume: thawing stale leader" p
-                                              "-- must fence itself under new leader" ldr)
-                                        (resume-pid! (node-pid c p))
-                                        (Thread/sleep 10000) ; allow stale-writer detection
-                                        (info "resume: stale leader" p
-                                              (if (proc-alive? (node-pid c p))
-                                                "still up (should be refusing)" "self-fenced (exited)"))
-                                        (kill-pid! (node-pid c p))   ; discard the fenced zombie
-                                        (start-standby! c p)
-                                        (await-fn (fn [] (or (mounted? c) (throw+ {:type ::not-mounted})))
-                                                  {:retry-interval 500 :log-interval 5000
-                                                   :log-message "resume: waiting for mount"})
-                                        (swap! cluster-roles assoc p :standby)
-                                        (str "resumed-" (name p)))
-                                    (do (heal-restart! c) "resume-fell-back-to-restart")))
-                 ;; Restart before peer-failure detection. Hello must defer to the
-                 ;; active standby and preserve its tail.
-                 :bounce-leader (let [n (leader-node) s (standby-node)]
-                                  (kill-pid! (node-pid c n))
-                                  (Thread/sleep 500)
-                                  (start-node! c n "leader")
-                                  (when s (swap! cluster-roles assoc s :leader))
-                                  (swap! cluster-roles assoc n :standby)
-                                  (str "bounced-leader-" (name n)))
-                 :blocked-restart (let [n (leader-node) s (standby-node)]
-                                    (sh! :rm :-f (get-in c [:nodes s :ninep]))
-                                    (kill-pid! (node-pid c n))
-                                    (swap! cluster-roles assoc n :dead)
-                                    (swap! cluster-roles assoc s :leader)
-                                    (await-fn (fn [] (or (node-9p-up? c s)
-                                                         (throw+ {:type ::no-promote})))
-                                              {:retry-interval 500 :log-interval 5000 :timeout 40000
-                                               :log-message "recovery: waiting for standby to promote"})
-                                    (Thread/sleep 3000)
-                                    (kill-pid! (node-pid c s))
-                                    (sh! :rm :-f (get-in c [:nodes s :ninep]))
-                                    (Thread/sleep 500)
-                                    (start-node! c s "standby")
-                                    (Thread/sleep 5000)
-                                    (when-not (proc-alive? (node-pid c s))
-                                      (throw+ {:type ::blocked-survivor-exited}))
-                                    (when (node-9p-up? c s)
-                                      (throw+ {:type ::unsafe-retake}))
-                                    (kill-pid! (node-pid c s))
-                                    (sh! :rm :-f (get-in c [:nodes s :ninep]))
-                                    (Thread/sleep 500)
-                                    (start-node! c s "leader" true)
-                                    (await-fn (fn [] (or (node-9p-up? c s)
-                                                         (throw+ {:type ::no-solo-recovery})))
-                                              {:retry-interval 500 :log-interval 5000 :timeout 60000
-                                               :log-message "recovery: waiting for solo startup"})
-                                    ;; Restore the paired config after the one-node startup.
-                                    (spit (node-cfg-path c s) (node-cfg-str c s "leader"))
-                                    (str "blocked-then-recovered-" (name s)))
-                 :heal-rejoin  (do (heal-rejoin! c) :healed-rejoin)
-                 ;; Cut replication traffic while retaining client and store access.
-                 ;; Marker validation retires the old server; the writer epoch
-                 ;; remains the durable-write fence.
-                 :partition  (let [r @relays]
-                               ((:cut! (:to-b r)))
-                               ((:cut! (:to-a r)))
-                               :partitioned)
-                 :heal-partition (let [r @relays]
-                                   ((:heal! (:to-b r)))
-                                   ((:heal! (:to-a r)))
-                                   (heal-restart! c) ; restore canonical topology
-                                   :healed-partition)
-                 :heal-restart (do (heal-restart! c) :healed-restart)))))
-    (teardown! [_ _test])))
+(defn takeover-target [c]
+  (let [from (leader-node)
+        to (standby-node)
+        epoch (when from (node-writer-epoch c from))]
+    (when-not (and to epoch)
+      (throw+ {:type ::takeover-not-ready :leader from :standby to :epoch epoch}))
+    {:from from :to to :epoch epoch}))
 
-;; Each fault has a paired recovery. MinIO is paused because restarting the
+(defrecord HaNemesis [takeover]
+  nemesis/Nemesis
+  (setup! [this _test] this)
+  (invoke! [_ test op]
+    (let [c (cfg test)]
+      (assoc op :value
+             (case (:f op)
+               :kill-leader  (let [n (leader-node) s (standby-node)]
+                               (reset! takeover (takeover-target c))
+                               (kill-pid! (node-pid c n))
+                               (swap! cluster-roles assoc n :dead)
+                               (when s (swap! cluster-roles assoc s :leader))
+                               (str "killed-leader-" (name n)))
+               :kill-standby (let [n (standby-node)]
+                               (kill-pid! (node-pid c n))
+                               (swap! cluster-roles assoc n :dead)
+                               (str "killed-standby-" (name n)))
+               :kill-both    (do (kill-pid! (node-pid c :a))
+                                 (kill-pid! (node-pid c :b))
+                                 (reset! cluster-roles {:a :dead :b :dead})
+                                 :killed-both)
+               :pause-store  (do (pause-pid! (:store-pid c)) :paused-store)
+               :resume-store (do (resume-pid! (:store-pid c))
+                                 ;; Restart ZeroFS after store recovery.
+                                 (Thread/sleep 500)
+                                 (heal-restart! c)
+                                 :resumed-store)
+               :await-serving (let [{:keys [from to epoch] :as target} @takeover]
+                                (when-not target
+                                  (throw+ {:type ::no-pending-takeover}))
+                                (await-fn
+                                 (fn []
+                                   (let [current (node-writer-epoch c to)]
+                                     (or (and current (> current epoch))
+                                         (throw+ {:type ::no-promoted-writer
+                                                  :node to :before epoch :current current}))))
+                                 {:retry-interval 500 :log-interval 5000 :timeout 40000
+                                  :log-message (str "failover: waiting for " (name to)
+                                                    " to serve after writer epoch " epoch)})
+                                (swap! cluster-roles assoc from :dead to :leader)
+                                :serving)
+               ;; Hold the leader through failure detection and claim grace.
+               :pause-leader  (let [n (leader-node) s (standby-node)]
+                                (pause-pid! (node-pid c n))
+                                (swap! cluster-roles assoc n :paused)
+                                (when s (swap! cluster-roles assoc s :leader))
+                                (str "paused-leader-" (name n)))
+               :resume-leader (let [p (paused-node) ldr (leader-node)]
+                                (if (and p ldr (not= p ldr))
+                                  (do (info "resume: thawing stale leader" p
+                                            "-- must fence itself under new leader" ldr)
+                                      (resume-pid! (node-pid c p))
+                                      (Thread/sleep 10000) ; allow stale-writer detection
+                                      (info "resume: stale leader" p
+                                            (if (proc-alive? (node-pid c p))
+                                              "still up (should be refusing)" "self-fenced (exited)"))
+                                      (kill-pid! (node-pid c p))   ; discard the fenced zombie
+                                      (start-standby! c p)
+                                      (await-fn (fn [] (or (mounted? c) (throw+ {:type ::not-mounted})))
+                                                {:retry-interval 500 :log-interval 5000
+                                                 :log-message "resume: waiting for mount"})
+                                      (swap! cluster-roles assoc p :standby)
+                                      (str "resumed-" (name p)))
+                                  (do (heal-restart! c) "resume-fell-back-to-restart")))
+               ;; Restart before peer-failure detection. Hello must defer to the
+               ;; active standby and preserve its tail.
+               :bounce-leader (let [n (leader-node) s (standby-node)]
+                                (kill-pid! (node-pid c n))
+                                (Thread/sleep 500)
+                                (start-node! c n "leader")
+                                (when s (swap! cluster-roles assoc s :leader))
+                                (swap! cluster-roles assoc n :standby)
+                                (str "bounced-leader-" (name n)))
+               :blocked-restart (let [n (leader-node) s (standby-node)]
+                                  (sh! :rm :-f (get-in c [:nodes s :ninep]))
+                                  (kill-pid! (node-pid c n))
+                                  (swap! cluster-roles assoc n :dead)
+                                  (swap! cluster-roles assoc s :leader)
+                                  (await-fn (fn [] (or (node-9p-up? c s)
+                                                       (throw+ {:type ::no-promote})))
+                                            {:retry-interval 500 :log-interval 5000 :timeout 40000
+                                             :log-message "recovery: waiting for standby to promote"})
+                                  (Thread/sleep 3000)
+                                  (kill-pid! (node-pid c s))
+                                  (sh! :rm :-f (get-in c [:nodes s :ninep]))
+                                  (Thread/sleep 500)
+                                  (start-node! c s "standby")
+                                  (Thread/sleep 5000)
+                                  (when-not (proc-alive? (node-pid c s))
+                                    (throw+ {:type ::blocked-survivor-exited}))
+                                  (when (node-9p-up? c s)
+                                    (throw+ {:type ::unsafe-retake}))
+                                  (kill-pid! (node-pid c s))
+                                  (sh! :rm :-f (get-in c [:nodes s :ninep]))
+                                  (Thread/sleep 500)
+                                  (start-node! c s "leader" true)
+                                  (await-fn (fn [] (or (node-9p-up? c s)
+                                                       (throw+ {:type ::no-solo-recovery})))
+                                            {:retry-interval 500 :log-interval 5000 :timeout 60000
+                                             :log-message "recovery: waiting for solo startup"})
+                                  ;; Restore the paired config after the one-node startup.
+                                  (spit (node-cfg-path c s) (node-cfg-str c s "leader"))
+                                  (str "blocked-then-recovered-" (name s)))
+               :heal-rejoin  (do (heal-rejoin! c) :healed-rejoin)
+               ;; Cut replication traffic while retaining client and store access.
+               ;; Marker validation retires the old server; the writer epoch
+               ;; remains the durable-write fence.
+               :partition  (let [r @relays]
+                             (reset! takeover (takeover-target c))
+                             ((:cut! (:to-b r)))
+                             ((:cut! (:to-a r)))
+                             :partitioned)
+               :heal-partition (let [r @relays]
+                                 ((:heal! (:to-b r)))
+                                 ((:heal! (:to-a r)))
+                                 (heal-restart! c)
+                                 :healed-partition)
+               :heal-restart (do (heal-restart! c) :healed-restart)))))
+  (teardown! [_ _test]))
+
+(defn ha-nemesis []
+  (->HaNemesis (atom nil)))
+
+;; Each fault has a paired recovery. SeaweedFS is paused because restarting the
 ;; single-drive test instance can lose acknowledged, un-fsynced PUTs.
 (def scenarios
   [{:fault :kill-leader  :heal :heal-rejoin}
@@ -908,7 +972,7 @@
    {:fault :kill-leader  :heal :heal-restart}
    {:fault :kill-standby :heal :heal-restart}
    {:fault :kill-both    :heal :heal-restart}
-   {:fault :pause-minio  :heal :resume-minio}
+   {:fault :pause-store  :heal :resume-store}
    ;; Hold through failure detection and the pre-open claim grace.
    {:fault :pause-leader :heal :resume-leader :hold 32}
    ;; Hello makes a restarted leader defer to an active standby.
@@ -927,6 +991,19 @@
           (gen/sleep (:hold s 20)) {:type :info :f (:heal s)}])
        (apply concat)
        cycle))
+
+(defn nemesis-checker
+  "A failed fault injection or recovery wait invalidates the experiment. Jepsen
+  records thrown nemesis errors as :info and otherwise continues the workload."
+  []
+  (reify checker/Checker
+    (check [_ _test history _opts]
+      (let [errors (filter #(and (= :nemesis (:process %))
+                                (or (:error %) (:exception %)))
+                           history)]
+        {:valid? (empty? errors)
+         :error-count (count errors)
+         :errors (mapv #(select-keys % [:f :error :exception]) (take 10 errors))}))))
 
 (defn set-checker
   "Fault-tolerant add/remove set check (replaces the grow-only set-full now that we
@@ -1408,7 +1485,7 @@
    (gen/clients (gen/once {:f :write :file "h"}))
    (gen/clients (gen/once {:f :fsync :file "h"}))
    (gen/sleep 2)
-   ;; Heal (restores connectivity + canonical roles) so teardown + final read are clean.
+   ;; Heal the pair so teardown + final read are clean.
    (gen/nemesis (gen/once {:type :info :f :heal-partition}))
    (gen/sleep 3)
    (gen/clients (gen/once {:f :read}))))
@@ -1501,6 +1578,7 @@
                                           (or (:fsync-dirent opts) (:fsync-rename opts))
                                           (dirent-honesty-checker)
                                           :else (fsync-honesty-checker))
+                         :nemesis       (nemesis-checker)
                          :perf          (checker/perf)})
                        (checker/compose
                         ;; :set  -> no :ok add lost, no :ok-removed value resurrected.
@@ -1511,6 +1589,7 @@
                         {:set     (set-checker)
                          :statfs  (statfs-checker)
                          :content (content-checker)
+                         :nemesis (nemesis-checker)
                          :perf    (checker/perf)}))
           :generator (cond
                        (:fsync-dirent opts) (dirent-gen)
@@ -1566,7 +1645,7 @@
 (def cli-opts
   "Extra CLI options. Path defaults read an env var first (set by run.sh locally
   or by CI), then fall back to portable values: a /tmp work dir, the repo's `ci`
-  build, and minio/mc resolved on PATH."
+  build, and weed resolved on PATH."
   [[nil "--work-dir DIR" "Working directory for the cluster + mount"
     :default (or (System/getenv "ZEROFS_JEPSEN_WORK") "/tmp/zerofs-jepsen-ha")]
    [nil "--mount-client CLIENT" "Mount client to exercise: fuse or native"
@@ -1574,10 +1653,8 @@
     :validate [#{"fuse" "native"} "Must be either fuse or native"]]
    [nil "--zerofs-bin PATH" "Path to the zerofs binary"
     :default (or (System/getenv "ZEROFS_BIN") "../../zerofs/target/ci/zerofs")]
-   [nil "--minio-bin PATH" "Path to the minio binary"
-    :default (or (System/getenv "MINIO_BIN") "minio")]
-   [nil "--mc-bin PATH" "Path to the mc (minio client) binary"
-    :default (or (System/getenv "MC_BIN") "mc")]
+   [nil "--weed-bin PATH" "Path to the SeaweedFS weed binary"
+    :default (or (System/getenv "WEED_BIN") "weed")]
    [nil "--[no-]fsync" "fsync every add (default true). --no-fsync acks writes without flushing, so a single Connected kill-leader failover tests semi-sync replication of un-fsynced writes."
     :default true]
    [nil "--fsync-honesty" "Run the fsync-durability-honesty scenario: a burst of un-fsync'd writes, then kill-both + cold restart, then a fsync. Asserts a successful fsync never reports success for the lost writes."

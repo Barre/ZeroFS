@@ -7,7 +7,10 @@
 use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
 use crate::fs::flush_coordinator::FlushCoordinator;
+use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
+use crate::fs::lock_manager::{KeyedLockGuard, MultiLockGuard};
+use crate::fs::metrics::SegmentFootprintDelta;
 use crate::fs::stats::FileSystemGlobalStats;
 use crate::fs::store::{DirectoryStore, ExtentStore, InodeStore};
 use crate::replication::ShipOutcome;
@@ -27,12 +30,71 @@ const PARALLEL_SEGCOUNT_READS: usize = 16;
 /// total_delta)` netted for this batch, `(current_live, current_total)` base).
 type SegBase = (bytes::Bytes, (i64, i64), (u64, u64));
 
+struct StagedSegcounts {
+    absolute: Vec<(bytes::Bytes, bytes::Bytes)>,
+    footprint: SegmentFootprintDelta,
+    reclaim_changed: bool,
+}
+
 type Reply = oneshot::Sender<Result<(), FsError>>;
+
+/// The inode locks that serialize one staged filesystem mutation.
+pub(crate) enum InodeLocks {
+    Single { _guard: KeyedLockGuard<InodeId> },
+    Multiple { _guards: MultiLockGuard<InodeId> },
+}
+
+impl From<KeyedLockGuard<InodeId>> for InodeLocks {
+    fn from(guard: KeyedLockGuard<InodeId>) -> Self {
+        Self::Single { _guard: guard }
+    }
+}
+
+impl From<MultiLockGuard<InodeId>> for InodeLocks {
+    fn from(guards: MultiLockGuard<InodeId>) -> Self {
+        Self::Multiple { _guards: guards }
+    }
+}
+
+/// A staged transaction and the inode locks under which its state was read.
+/// Submission moves both into the commit queue as one unit.
+pub(crate) struct LockedMutation {
+    txn: Transaction,
+    locks: InodeLocks,
+}
+
+impl LockedMutation {
+    pub(crate) fn new(txn: Transaction, locks: impl Into<InodeLocks>) -> Self {
+        Self {
+            txn,
+            locks: locks.into(),
+        }
+    }
+}
+
+enum PendingReply {
+    Plain(Reply),
+    Locked(Reply, InodeLocks),
+}
+
+impl PendingReply {
+    fn send(self, result: Result<(), FsError>) {
+        match self {
+            Self::Plain(reply) => {
+                let _ = reply.send(result);
+            }
+            Self::Locked(reply, locks) => {
+                drop(locks);
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
 
 // `Barrier` is test-only; boxing `Commit` would add an allocation to the hot path.
 #[allow(clippy::large_enum_variant)]
 enum Request {
-    Commit(Transaction, Reply),
+    Commit(Transaction, PendingReply),
     #[cfg(any(test, dst))]
     Barrier(Reply),
 }
@@ -40,6 +102,14 @@ enum Request {
 #[derive(Clone)]
 pub struct WriteCoordinator {
     sender: mpsc::UnboundedSender<Request>,
+}
+
+/// An allocated commit queue whose worker has not started yet. Boot uses this
+/// brief state only while assembling the mutually-referencing data plane.
+#[must_use = "the commit worker must be started before the filesystem is exposed"]
+pub(crate) struct PendingWriteCoordinator {
+    receiver: mpsc::UnboundedReceiver<Request>,
+    persisted_counter: u64,
 }
 
 /// Commit worker dependencies.
@@ -62,45 +132,30 @@ struct WorkerContext {
 }
 
 impl WriteCoordinator {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        db: Arc<Db>,
-        inode_store: InodeStore,
-        directory_store: DirectoryStore,
-        flush_coordinator: FlushCoordinator,
-        key_codec: Arc<KeyCodec>,
-        global_stats: Arc<FileSystemGlobalStats>,
-        sync_writes: bool,
-        replicator: Option<crate::replication::Replicator>,
-        dedup: Arc<crate::dedup::DedupCache>,
-        lineage_token: u64,
-        extent_store: ExtentStore,
-    ) -> Self {
-        // Capture before spawning so concurrent allocations cannot advance the
-        // worker's initial persisted watermark.
-        let initial_counter = inode_store.next_id();
+    pub(crate) fn channel(persisted_counter: u64) -> (Self, PendingWriteCoordinator) {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let ctx = WorkerContext {
-            db,
-            inode_store,
-            directory_store,
-            flush_coordinator,
-            key_codec,
-            global_stats,
-            sync_writes,
-            replicator,
-            dedup,
-            lineage_token,
-            extent_store,
+        let pending = PendingWriteCoordinator {
+            receiver,
+            persisted_counter,
         };
-        spawn_named("commit-worker", worker_loop(ctx, receiver, initial_counter));
-        Self { sender }
+        (Self { sender }, pending)
     }
 
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
-            .send(Request::Commit(txn, reply_tx))
+            .send(Request::Commit(txn, PendingReply::Plain(reply_tx)))
+            .map_err(|_| FsError::IoError)?;
+        reply_rx.await.map_err(|_| FsError::IoError)?
+    }
+
+    /// Submit a transaction together with the inode locks used to stage it.
+    /// The queue owns the locks until the batch resolves.
+    pub(crate) async fn commit_locked(&self, mutation: LockedMutation) -> Result<(), FsError> {
+        let LockedMutation { txn, locks } = mutation;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(Request::Commit(txn, PendingReply::Locked(reply_tx, locks)))
             .map_err(|_| FsError::IoError)?;
         reply_rx.await.map_err(|_| FsError::IoError)?
     }
@@ -116,53 +171,71 @@ impl WriteCoordinator {
         reply_rx.await.map_err(|_| FsError::IoError)?
     }
 
-    /// Weak commit handle for data-plane GC and compaction.
-    pub fn downgrade(&self) -> WeakWriteCoordinator {
+    /// Avoids the worker/`ExtentStore` ownership cycle.
+    pub(crate) fn downgrade(&self) -> WeakWriteCoordinator {
         WeakWriteCoordinator(self.sender.downgrade())
     }
 }
 
-/// Weak commit handle held by `ExtentStore`; a strong sender would form a cycle.
+impl PendingWriteCoordinator {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start(
+        self,
+        db: Arc<Db>,
+        inode_store: InodeStore,
+        directory_store: DirectoryStore,
+        flush_coordinator: FlushCoordinator,
+        key_codec: Arc<KeyCodec>,
+        global_stats: Arc<FileSystemGlobalStats>,
+        sync_writes: bool,
+        replicator: Option<crate::replication::Replicator>,
+        dedup: Arc<crate::dedup::DedupCache>,
+        lineage_token: u64,
+        extent_store: ExtentStore,
+    ) {
+        let ctx = WorkerContext {
+            db,
+            inode_store,
+            directory_store,
+            flush_coordinator,
+            key_codec,
+            global_stats,
+            sync_writes,
+            replicator,
+            dedup,
+            lineage_token,
+            extent_store,
+        };
+        let worker = worker_loop(ctx, self.receiver, self.persisted_counter);
+        spawn_named("commit-worker", worker);
+    }
+}
+
 #[derive(Clone)]
-pub struct WeakWriteCoordinator(mpsc::WeakUnboundedSender<Request>);
+pub(crate) struct WeakWriteCoordinator(mpsc::WeakUnboundedSender<Request>);
 
 impl WeakWriteCoordinator {
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
         let sender = self.0.upgrade().ok_or(FsError::IoError)?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        sender
-            .send(Request::Commit(txn, reply_tx))
-            .map_err(|_| FsError::IoError)?;
-        reply_rx.await.map_err(|_| FsError::IoError)?
+        WriteCoordinator { sender }.commit(txn).await
     }
-}
 
-/// Whole-store footprint change for one committed batch.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct SegFootprintDelta {
-    /// Counters changing from zero to nonzero.
-    pub d_segments: i64,
-    pub d_appended: i64,
-    pub d_live: i64,
+    pub async fn commit_locked(&self, mutation: LockedMutation) -> Result<(), FsError> {
+        let sender = self.0.upgrade().ok_or(FsError::IoError)?;
+        WriteCoordinator { sender }.commit_locked(mutation).await
+    }
 }
 
 /// Materialize segment deltas as absolute counters and return their wire values.
 /// The commit worker is the sole writer of these keys. `total` is monotonic.
-pub(crate) async fn stage_seg_deltas(
+async fn stage_seg_deltas(
     db: &Db,
-    deltas: impl IntoIterator<Item = (bytes::Bytes, (i64, i64))>,
+    deltas: BTreeMap<bytes::Bytes, (i64, i64)>,
     batch: &mut WriteBatch,
-) -> Result<(Vec<(bytes::Bytes, bytes::Bytes)>, SegFootprintDelta), FsError> {
-    // Preserve deterministic read order.
-    let mut agg: BTreeMap<bytes::Bytes, (i64, i64)> = BTreeMap::new();
-    for (k, (dl, dt)) in deltas {
-        let e = agg.entry(k).or_insert((0, 0));
-        e.0 = e.0.saturating_add(dl);
-        e.1 = e.1.saturating_add(dt);
-    }
+) -> Result<StagedSegcounts, FsError> {
     // Missing counters start at zero. Read and decode failures abort the batch;
-    // undercounting live bytes can make GC delete referenced data.
-    let bases: Vec<SegBase> = stream::iter(agg)
+    // undercounting live bytes can make reclamation delete referenced data.
+    let bases: Vec<SegBase> = stream::iter(deltas)
         .map(|(key, net)| async move {
             match db.get_bytes_internal(&key).await {
                 Ok(None) => Ok((key, net, (0, 0))),
@@ -177,32 +250,36 @@ pub(crate) async fn stage_seg_deltas(
         .await?;
 
     let mut out = Vec::with_capacity(bases.len());
-    let mut fd = SegFootprintDelta::default();
+    let mut footprint_delta = SegmentFootprintDelta::default();
+    let mut reclaim_changed = false;
     for (key, (net_live, net_total), (cur_live, cur_total)) in bases {
         let live = (cur_live as i128 + net_live as i128).max(0) as u64;
         // `total` is monotonic: clamp to at least its current value.
         let total = (cur_total as i128 + net_total as i128).max(cur_total as i128) as u64;
         // Monitoring deltas use the clamped absolute values and saturating sums.
-        fd.d_live = fd.d_live.saturating_add(live as i64 - cur_live as i64);
-        fd.d_appended = fd
-            .d_appended
-            .saturating_add(total as i64 - cur_total as i64);
-        fd.d_segments = fd
-            .d_segments
-            .saturating_add((cur_total == 0 && total > 0) as i64);
+        footprint_delta.merge(SegmentFootprintDelta::new(
+            (cur_total == 0 && total > 0) as i64,
+            total as i64 - cur_total as i64,
+            live as i64 - cur_live as i64,
+        ));
+        reclaim_changed |= total.saturating_sub(live) > cur_total.saturating_sub(cur_live);
         let val = KeyCodec::encode_segcount(live, total);
         batch.put_bytes(key.clone(), val.clone());
         out.push((key, val));
     }
-    Ok((out, fd))
+    Ok(StagedSegcounts {
+        absolute: out,
+        footprint: footprint_delta,
+        reclaim_changed,
+    })
 }
 
 async fn worker_loop(
     mut ctx: WorkerContext,
     mut rx: mpsc::UnboundedReceiver<Request>,
-    initial_counter: u64,
+    persisted_counter: u64,
 ) {
-    let mut last_emitted_counter = initial_counter;
+    let mut last_emitted_counter = persisted_counter;
     // One durable Solo taint per leader process.
     let mut taint_written = false;
     loop {
@@ -279,7 +356,8 @@ async fn worker_loop(
         let mut inode_cache_invalidations: HashSet<u64> = HashSet::new();
         let mut directory_entry_cache_invalidations: HashSet<(u64, bytes::Bytes)> = HashSet::new();
         let mut shard_deltas: HashMap<usize, (i64, i64)> = HashMap::new();
-        let mut seg_map: HashMap<bytes::Bytes, (i64, i64)> = HashMap::new();
+        let mut seg_map: BTreeMap<bytes::Bytes, (i64, i64)> = BTreeMap::new();
+        let mut segcount_delete_delta = SegmentFootprintDelta::default();
         let mut batch_dedup_entries: Vec<crate::dedup::DedupEntry> = Vec::new();
         for (mut txn, reply) in batch {
             if let Some(guard) = txn.take_extent_ref_guard() {
@@ -311,12 +389,17 @@ async fn worker_loop(
                 e.0 = e.0.saturating_add(dl);
                 e.1 = e.1.saturating_add(dt);
             }
+            segcount_delete_delta.merge(txn.take_segcount_delete_delta());
             if replicating {
                 repl_ops.extend(txn.apply_to_collecting(&mut merged));
             } else {
                 txn.apply_to(&mut merged);
             }
             replies.push(reply);
+        }
+        #[cfg(any(test, dst))]
+        if let Some(reply) = barrier_reply {
+            replies.push(PendingReply::Plain(reply));
         }
 
         // Persist the allocation watermark only after it advances.
@@ -354,9 +437,12 @@ async fn worker_loop(
         }
 
         // The commit worker is the sole segment-counter writer.
-        let (seg_abs, footprint_delta) = match stage_seg_deltas(&ctx.db, seg_map, &mut merged).await
-        {
-            Ok(v) => v,
+        let StagedSegcounts {
+            absolute: seg_abs,
+            footprint: mut footprint_delta,
+            reclaim_changed,
+        } = match stage_seg_deltas(&ctx.db, seg_map, &mut merged).await {
+            Ok(staged) => staged,
             Err(e) => {
                 // A failed staged counter may have advanced the in-memory inode
                 // watermark. Burn one ID so the next commit persists past it.
@@ -364,15 +450,12 @@ async fn worker_loop(
                     ctx.inode_store.allocate();
                 }
                 for reply in replies {
-                    let _ = reply.send(Err(e));
-                }
-                #[cfg(any(test, dst))]
-                if let Some(reply) = barrier_reply {
-                    let _ = reply.send(Err(e));
+                    reply.send(Err(e));
                 }
                 continue;
             }
         };
+        footprint_delta.merge(segcount_delete_delta);
         if !seg_abs.is_empty() {
             any_ops = true;
             if replicating {
@@ -438,11 +521,7 @@ async fn worker_loop(
                 ctx.inode_store.allocate();
             }
             for reply in replies {
-                let _ = reply.send(Err(FsError::LeaderRejectedBeforeApply));
-            }
-            #[cfg(any(test, dst))]
-            if let Some(reply) = barrier_reply {
-                let _ = reply.send(Err(FsError::LeaderRejectedBeforeApply));
+                reply.send(Err(FsError::LeaderRejectedBeforeApply));
             }
             continue;
         }
@@ -542,15 +621,16 @@ async fn worker_loop(
         }
 
         // Publish in-memory counters after local commit.
-        if result.is_ok() {
+        if local_applied && any_ops {
             for shard in &staged {
                 ctx.global_stats.publish(shard);
             }
-            ctx.extent_store.segment_gc_stats().apply_footprint_delta(
-                footprint_delta.d_segments,
-                footprint_delta.d_appended,
-                footprint_delta.d_live,
-            );
+            ctx.extent_store
+                .segment_reclaim_stats()
+                .apply_footprint_delta(footprint_delta);
+            if reclaim_changed {
+                ctx.extent_store.record_reclaim_activity();
+            }
         }
 
         drop(extent_ref_guards);
@@ -565,11 +645,7 @@ async fn worker_loop(
             ctx.inode_store.allocate();
         }
         for reply in replies {
-            let _ = reply.send(result);
-        }
-        #[cfg(any(test, dst))]
-        if let Some(reply) = barrier_reply {
-            let _ = reply.send(result);
+            reply.send(result);
         }
     }
 }
@@ -597,6 +673,53 @@ mod tests {
         ZeroFS::new_in_memory().await.unwrap()
     }
 
+    #[tokio::test]
+    async fn cancelled_multi_inode_mutation_keeps_locks_until_apply() {
+        let fs = make_fs().await;
+        let key = codec().extent_key(41, 0);
+        let locks = fs.lock_manager.acquire_multi(vec![41, 42]).await;
+        let mut txn = Transaction::new();
+        txn.put_bytes(&key.into(), Bytes::from_static(b"applied"));
+        let mutation = LockedMutation::new(txn, locks);
+        let write_barrier = fs.db.flush_barrier().write_owned().await;
+        let coordinator = fs.write_coordinator.clone();
+        let commit = tokio::spawn(async move { coordinator.commit_locked(mutation).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::task::yield_now().await;
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    fs.write_coordinator.barrier(),
+                )
+                .await
+                {
+                    Ok(result) => result.unwrap(),
+                    Err(_) => break,
+                }
+            }
+        })
+        .await
+        .expect("locked mutation did not reach the commit queue");
+
+        commit.abort();
+        assert!(matches!(commit.await, Err(error) if error.is_cancelled()));
+        let mut reacquire = Box::pin(fs.lock_manager.acquire(41));
+        assert!(
+            futures::poll!(reacquire.as_mut()).is_pending(),
+            "cancellation released a multi-inode lock before apply"
+        );
+
+        drop(write_barrier);
+        let _guard = tokio::time::timeout(std::time::Duration::from_secs(5), reacquire)
+            .await
+            .expect("multi-inode locks were not returned after apply");
+        assert_eq!(
+            fs.db.get_bytes(key.as_ref()).await.unwrap(),
+            Some(Bytes::from_static(b"applied"))
+        );
+    }
+
     fn file_size(inode: Option<Inode>) -> Option<u64> {
         match inode {
             Some(Inode::File(file)) => Some(file.size),
@@ -606,6 +729,17 @@ mod tests {
 
     fn codec() -> KeyCodec {
         KeyCodec::new()
+    }
+
+    fn footprint(fs: &ZeroFS) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let stats = fs.extent_store.segment_reclaim_stats();
+        (
+            stats.segment_count.load(Relaxed),
+            stats.appended_bytes.load(Relaxed),
+            stats.live_bytes.load(Relaxed),
+        )
     }
 
     #[tokio::test]
@@ -696,9 +830,9 @@ mod tests {
         let mut txn = Transaction::new();
         // Use a real codec-built key so the segment extractor accepts it.
         let key = codec().extent_key(1, 0);
-        txn.put_bytes(&key, Bytes::from_static(b"value"));
+        txn.put_bytes(&key.into(), Bytes::from_static(b"value"));
         fs.write_coordinator.commit(txn).await.unwrap();
-        let v = fs.db.get_bytes(&key).await.unwrap();
+        let v = fs.db.get_bytes(key.as_ref()).await.unwrap();
         assert_eq!(v.as_deref(), Some(&b"value"[..]));
     }
 
@@ -713,7 +847,7 @@ mod tests {
             let k = codec.extent_key(1, i);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&k, Bytes::from(vec![1u8; 8]));
+                txn.put_bytes(&k.into(), Bytes::from(vec![1u8; 8]));
                 c.commit(txn).await
             }));
         }
@@ -721,7 +855,11 @@ mod tests {
             h.await.unwrap().unwrap();
         }
         for i in 0u64..32 {
-            let v = fs.db.get_bytes(&codec.extent_key(1, i)).await.unwrap();
+            let v = fs
+                .db
+                .get_bytes(codec.extent_key(1, i).as_ref())
+                .await
+                .unwrap();
             assert!(v.is_some());
         }
     }
@@ -737,7 +875,7 @@ mod tests {
             let k = codec.extent_key(2, i);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&k, Bytes::from(vec![2u8; 8]));
+                txn.put_bytes(&k.into(), Bytes::from(vec![2u8; 8]));
                 c.commit(txn).await
             }));
         }
@@ -745,7 +883,11 @@ mod tests {
             h.await.unwrap().unwrap();
         }
         for i in 0u64..16 {
-            let v = fs.db.get_bytes(&codec.extent_key(2, i)).await.unwrap();
+            let v = fs
+                .db
+                .get_bytes(codec.extent_key(2, i).as_ref())
+                .await
+                .unwrap();
             assert!(
                 v.is_some(),
                 "extent {i} not durable after sync_writes commit"
@@ -768,38 +910,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn barrier_waits_for_prior_footprint_publication() {
+    async fn barrier_follows_combined_footprint_publication() {
         let fs = make_fs().await;
-        let seg_key = codec().segcount_key(1, 1);
-        let mut txn = Transaction::new();
-        txn.add_seg_delta(&seg_key, 57_169, 57_169);
+        let seg_key = codec().segcount_key(2, 1);
+        let new_seg_key = codec().segcount_key(2, 2);
+        let mut seed = Transaction::new();
+        seed.add_seg_delta(&seg_key, 17, 17);
+        fs.write_coordinator.commit(seed).await.unwrap();
 
-        // Queue the commit without awaiting its own reply. The barrier must not
-        // complete until the worker has both applied it and published gauges.
-        let (reply_tx, _reply_rx) = oneshot::channel();
+        let write_barrier = fs.db.flush_barrier().write_owned().await;
+        let mut txn = Transaction::new();
+        txn.delete_segcount(&seg_key, 17, 17);
+        txn.add_seg_delta(&new_seg_key, 23, 23);
+        let (reply, applied) = oneshot::channel();
         fs.write_coordinator
             .sender
-            .send(Request::Commit(txn, reply_tx))
+            .send(Request::Commit(txn, PendingReply::Plain(reply)))
             .unwrap();
-        fs.write_coordinator.barrier().await.unwrap();
+        drop(applied);
 
-        let stats = fs.extent_store.segment_gc_stats();
-        assert_eq!(
-            stats
-                .segment_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            stats
-                .appended_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            57_169
-        );
-        assert_eq!(
-            stats.live_bytes.load(std::sync::atomic::Ordering::Relaxed),
-            57_169
-        );
+        // The barrier cannot reply until the preceding commit applies and
+        // publishes both deltas.
+        let mut barrier = Box::pin(fs.write_coordinator.barrier());
+        assert!(futures::poll!(barrier.as_mut()).is_pending());
+        drop(write_barrier);
+        barrier.await.unwrap();
+        assert!(fs.db.get_bytes(&seg_key).await.unwrap().is_none());
+        assert_eq!(footprint(&fs), (1, 23, 23));
     }
 
     #[tokio::test]
@@ -831,7 +968,7 @@ mod tests {
 
         // A commit that doesn't allocate any inode.
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec().extent_key(3, 0), Bytes::from_static(b"v"));
+        txn.put_bytes(&codec().extent_key(3, 0).into(), Bytes::from_static(b"v"));
         fs.write_coordinator.commit(txn).await.unwrap();
 
         let after = fs.db.get_bytes(&counter_key).await.unwrap();
@@ -843,7 +980,7 @@ mod tests {
         // Now allocate and commit; counter must advance on disk.
         let _id = fs.inode_store.allocate();
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec().extent_key(3, 1), Bytes::from_static(b"v"));
+        txn.put_bytes(&codec().extent_key(3, 1).into(), Bytes::from_static(b"v"));
         fs.write_coordinator.commit(txn).await.unwrap();
 
         let after_allocate = fs.db.get_bytes(&counter_key).await.unwrap();
@@ -870,12 +1007,15 @@ mod tests {
             .unwrap();
 
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(7, 0), Bytes::from_static(b"v"));
+        txn.put_bytes(&codec.extent_key(7, 0).into(), Bytes::from_static(b"v"));
         txn.add_seg_delta(&seg_key, 5, 5);
+        txn.delete_segcount(&codec.segcount_key(1, 2), 7, 13);
         fs.write_coordinator
             .commit(txn)
             .await
             .expect_err("a corrupt segcount base must abort the batch, not default to 0");
+
+        assert_eq!(footprint(&fs), (0, 0, 0));
     }
 
     #[tokio::test]
@@ -898,7 +1038,7 @@ mod tests {
         // that batch (and the staged counter put) to the segcount abort.
         let id = fs.inode_store.allocate();
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(id, 0), Bytes::from_static(b"v"));
+        txn.put_bytes(&codec.extent_key(id, 0).into(), Bytes::from_static(b"v"));
         txn.add_seg_delta(&seg_key, 5, 5);
         fs.write_coordinator.commit(txn).await.unwrap_err();
 
@@ -906,7 +1046,7 @@ mod tests {
         // covering `id` (via the id burned on abort); otherwise a restart
         // would hand out `id` again over this batch's durable records.
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(id, 1), Bytes::from_static(b"w"));
+        txn.put_bytes(&codec.extent_key(id, 1).into(), Bytes::from_static(b"w"));
         fs.write_coordinator.commit(txn).await.unwrap();
 
         let persisted = fs
@@ -942,7 +1082,7 @@ mod tests {
             let key = codec.extent_key(inode_id, 0);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&key, Bytes::from_static(b"x"));
+                txn.put_bytes(&key.into(), Bytes::from_static(b"x"));
                 txn.add_stats_delta(inode_id, ((k + 1) * 10) as i64, 1);
                 c.commit(txn).await
             }));
@@ -990,7 +1130,7 @@ mod tests {
             let key = codec.extent_key(inode_id, 1);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&key, Bytes::from_static(b"y"));
+                txn.put_bytes(&key.into(), Bytes::from_static(b"y"));
                 txn.add_stats_delta(inode_id, -(((k + 1) * 10) as i64), 0);
                 c.commit(txn).await
             }));
@@ -1132,7 +1272,8 @@ mod tests {
 
     /// A second coordinator over the same fs's stores, with a replicator attached.
     fn replicating_coordinator(fs: &ZeroFS, replicator: Replicator) -> WriteCoordinator {
-        WriteCoordinator::new(
+        let (coordinator, pending) = WriteCoordinator::channel(fs.inode_store.next_id());
+        pending.start(
             fs.db.clone(),
             fs.inode_store.clone(),
             fs.directory_store.clone(),
@@ -1144,7 +1285,8 @@ mod tests {
             fs.dedup.clone(),
             fs.lineage_token,
             fs.extent_store.clone(),
-        )
+        );
+        coordinator
     }
 
     #[tokio::test]
@@ -1205,7 +1347,7 @@ mod tests {
         let key = codec().extent_key(7, 0);
         let flushes_before = fs.flush_coordinator.completed_flush_count();
         let mut txn = Transaction::new();
-        txn.put_bytes(&key, Bytes::from_static(b"never-applied"));
+        txn.put_bytes(&key.into(), Bytes::from_static(b"never-applied"));
         assert_eq!(
             fs.write_coordinator
                 .commit(txn)
@@ -1259,7 +1401,7 @@ mod tests {
         let key = codec.extent_key(1, 0);
         let flushes_before = fs.flush_coordinator.completed_flush_count();
         let mut txn = Transaction::new();
-        txn.put_bytes(&key, Bytes::from_static(b"v"));
+        txn.put_bytes(&key.into(), Bytes::from_static(b"v"));
         let error = coord
             .commit(txn)
             .await
@@ -1271,13 +1413,13 @@ mod tests {
             "a writer proven stale must not flush before returning the clean failure"
         );
         assert!(
-            fs.db.get_bytes(&key).await.unwrap().is_none(),
+            fs.db.get_bytes(key.as_ref()).await.unwrap().is_none(),
             "a deposed leader must not apply the rejected batch"
         );
 
         // Deposal is terminal: later batches fail too.
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(1, 1), Bytes::from_static(b"w"));
+        txn.put_bytes(&codec.extent_key(1, 1).into(), Bytes::from_static(b"w"));
         assert_eq!(
             coord.commit(txn).await.expect_err("deposal must be sticky"),
             FsError::LeaderRejectedBeforeApply
@@ -1309,10 +1451,9 @@ mod tests {
 
         let first_commit = {
             let coordinator = fs.write_coordinator.clone();
-            let first_key = first_key.clone();
             tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&first_key, Bytes::from_static(b"first"));
+                txn.put_bytes(&first_key.into(), Bytes::from_static(b"first"));
                 coordinator.commit(txn).await
             })
         };
@@ -1401,7 +1542,7 @@ mod tests {
         // The Solo mutation follows the lineage-taint flush.
         let solo_key = codec().extent_key(91, 0);
         let mut solo = Transaction::new();
-        solo.put_bytes(&solo_key, Bytes::from_static(b"solo"));
+        solo.put_bytes(&solo_key.into(), Bytes::from_static(b"solo"));
         fs.write_coordinator.commit(solo).await.unwrap();
         let ha_stamp_key = codec().ha_seqno_key();
         let solo_stamp = fs
@@ -1420,10 +1561,9 @@ mod tests {
         let op_id = [0x91; 16];
         let reconnect_commit = {
             let coordinator = fs.write_coordinator.clone();
-            let reconnect_key = reconnect_key.clone();
             tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&reconnect_key, Bytes::from_static(b"reconnected"));
+                txn.put_bytes(&reconnect_key.into(), Bytes::from_static(b"reconnected"));
                 txn.set_dedup_result(op_id, crate::dedup::DedupResult::Applied);
                 coordinator.commit(txn).await
             })
@@ -1445,7 +1585,11 @@ mod tests {
             "the reconnect batch must wait behind the Solo-base barrier"
         );
         assert!(
-            fs.db.get_bytes(&reconnect_key).await.unwrap().is_none(),
+            fs.db
+                .get_bytes(reconnect_key.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
             "the reconnect mutation must not apply before the base flush"
         );
         assert!(
@@ -1493,7 +1637,10 @@ mod tests {
 
         lease.renew(std::time::Duration::from_secs(30));
         let mut later = Transaction::new();
-        later.put_bytes(&codec().extent_key(91, 2), Bytes::from_static(b"later"));
+        later.put_bytes(
+            &codec().extent_key(91, 2).into(),
+            Bytes::from_static(b"later"),
+        );
         fs.write_coordinator
             .commit(later)
             .await
@@ -1513,14 +1660,14 @@ mod tests {
         let codec = codec();
 
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(1, 0), Bytes::from_static(b"a"));
+        txn.put_bytes(&codec.extent_key(1, 0).into(), Bytes::from_static(b"a"));
         coord.commit(txn).await.unwrap();
         let baseline = fs.flush_coordinator.completed_flush_count();
 
         control.set_sender_for_tests(None).await;
         for i in 1..=2u64 {
             let mut txn = Transaction::new();
-            txn.put_bytes(&codec.extent_key(1, i), Bytes::from_static(b"s"));
+            txn.put_bytes(&codec.extent_key(1, i).into(), Bytes::from_static(b"s"));
             coord.commit(txn).await.unwrap();
         }
         assert_eq!(
@@ -1534,7 +1681,7 @@ mod tests {
             .await;
         let reconnect_op_id = [0xa7; 16];
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(1, 3), Bytes::from_static(b"c"));
+        txn.put_bytes(&codec.extent_key(1, 3).into(), Bytes::from_static(b"c"));
         txn.set_dedup_result(reconnect_op_id, crate::dedup::DedupResult::Applied);
         coord.commit(txn).await.unwrap();
         assert_eq!(
@@ -1548,7 +1695,7 @@ mod tests {
         ));
 
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(1, 4), Bytes::from_static(b"d"));
+        txn.put_bytes(&codec.extent_key(1, 4).into(), Bytes::from_static(b"d"));
         coord.commit(txn).await.unwrap();
         assert_eq!(
             fs.flush_coordinator.completed_flush_count(),
@@ -1568,7 +1715,10 @@ mod tests {
         let coord = replicating_coordinator(&fs, repl);
 
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec().extent_key(1, 0), Bytes::from_static(b"acked"));
+        txn.put_bytes(
+            &codec().extent_key(1, 0).into(),
+            Bytes::from_static(b"acked"),
+        );
         coord.commit(txn).await.unwrap();
         let baseline = fs.flush_coordinator.completed_flush_count();
         assert_eq!(
@@ -1599,20 +1749,17 @@ mod tests {
         let baseline = fs.flush_coordinator.completed_flush_count();
 
         let mut solo = Transaction::new();
-        let solo_tail = fs
-            .extent_store
+        fs.extent_store
             .write(&mut solo, 41, 0, &Bytes::from_static(b"solo"), 0)
             .await
             .unwrap();
         coord.commit(solo).await.unwrap();
-        fs.extent_store.apply_tail_update(41, solo_tail);
 
         control
             .set_sender_for_tests(Some(connect_sender(&endpoint).await))
             .await;
         let mut reconnect = Transaction::new();
-        let reconnect_tail = fs
-            .extent_store
+        fs.extent_store
             .write(
                 &mut reconnect,
                 41,
@@ -1626,7 +1773,6 @@ mod tests {
             .await
             .expect("the base flush must not deadlock on the extent publication guard")
             .unwrap();
-        fs.extent_store.apply_tail_update(41, reconnect_tail);
 
         assert_eq!(
             fs.extent_store.read(41, 0, 16).await.unwrap().as_ref(),

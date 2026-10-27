@@ -236,8 +236,8 @@ impl ObjectStore for SimStore {
         self.inner
             .delete_stream(gated)
             .map(move |res| {
-                // Fail-after: the object is gone but the caller sees an error
-                // (GC must fail closed, then find ObjectAbsent next pass).
+                // Fail-after: the object is gone but the caller sees an error.
+                // Reclamation keeps it, then finds ObjectAbsent next scan.
                 let loc = res?;
                 if hooks.draw_fault("fault-after", "del", &loc) {
                     return Err(Hooks::transient());
