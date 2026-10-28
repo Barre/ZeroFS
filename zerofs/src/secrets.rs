@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use region::{Allocation, LockGuard, Protection};
 use std::fmt;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, thiserror::Error)]
@@ -170,7 +171,8 @@ impl EncryptionPassword {
     }
 
     /// Expand shell-style environment references, assembling the result
-    /// directly in locked memory.
+    /// directly in locked memory. An unset variable reads its `_FILE`
+    /// fallback directly into locked memory when configured.
     ///
     /// This preserves the syntax supported by the config's other expandable
     /// strings: `$VAR`, `${VAR}`, `${VAR:-default}`, and `$$` escaping.
@@ -180,6 +182,7 @@ impl EncryptionPassword {
         enum Piece<'a> {
             Literal(&'a str),
             Env(Zeroizing<String>),
+            File(LockedText),
         }
 
         let source = self.expose_secret();
@@ -216,10 +219,25 @@ impl EncryptionPassword {
                         _ => (expression, None),
                     };
 
-                    match std::env::var(name) {
-                        Ok(value) => pieces.push(Piece::Env(Zeroizing::new(value))),
-                        Err(_) if default.is_some() => {
+                    match environment_source(name) {
+                        Ok(Some(EnvironmentSource::Direct(value))) => {
+                            pieces.push(Piece::Env(Zeroizing::new(value)));
+                        }
+                        Ok(Some(EnvironmentSource::File {
+                            file_variable,
+                            path,
+                        })) => pieces.push(Piece::File(read_file_backed_locked(
+                            name,
+                            &file_variable,
+                            &path,
+                        )?)),
+                        Ok(None) if default.is_some() => {
                             pieces.push(Piece::Literal(default.expect("checked above")));
+                        }
+                        Ok(None) => {
+                            return Err(std::env::VarError::NotPresent).with_context(|| {
+                                format!("Failed to expand environment variable `{name}`")
+                            });
                         }
                         Err(error) => {
                             return Err(error).with_context(|| {
@@ -238,10 +256,24 @@ impl EncryptionPassword {
                         .last()
                         .expect("first character was checked");
                     let name = &after_dollar[..name_len];
-                    let value = std::env::var(name).with_context(|| {
-                        format!("Failed to expand environment variable `{name}`")
-                    })?;
-                    pieces.push(Piece::Env(Zeroizing::new(value)));
+                    match environment_source(name)
+                        .with_context(|| format!("Failed to expand environment variable `{name}`"))?
+                        .ok_or(std::env::VarError::NotPresent)
+                        .with_context(|| {
+                            format!("Failed to expand environment variable `{name}`")
+                        })? {
+                        EnvironmentSource::Direct(value) => {
+                            pieces.push(Piece::Env(Zeroizing::new(value)));
+                        }
+                        EnvironmentSource::File {
+                            file_variable,
+                            path,
+                        } => pieces.push(Piece::File(read_file_backed_locked(
+                            name,
+                            &file_variable,
+                            &path,
+                        )?)),
+                    }
                     remainder = &after_dollar[name_len..];
                 }
                 Some('$') => {
@@ -262,6 +294,7 @@ impl EncryptionPassword {
             .map(|piece| match piece {
                 Piece::Literal(text) => text.len(),
                 Piece::Env(value) => value.len(),
+                Piece::File(value) => value.expose_secret().len(),
             })
             .sum();
         let mut buf = LockedBuf::with_capacity(expanded_len)
@@ -270,6 +303,7 @@ impl EncryptionPassword {
             let bytes = match piece {
                 Piece::Literal(text) => text.as_bytes(),
                 Piece::Env(value) => value.as_bytes(),
+                Piece::File(value) => value.expose_secret().as_bytes(),
             };
             buf.push_bytes(bytes)
                 .context("Failed to protect encryption password in memory")?;
@@ -329,6 +363,13 @@ impl LockedText {
         Ok(Self(buf))
     }
 
+    fn trim_terminal_line_endings(mut self) -> Self {
+        while matches!(self.0.as_bytes().last(), Some(b'\n' | b'\r')) {
+            self.0.len -= 1;
+        }
+        self
+    }
+
     pub(crate) fn expose_secret(&self) -> &str {
         std::str::from_utf8(self.0.as_bytes()).expect("constructed from validated UTF-8")
     }
@@ -341,7 +382,7 @@ impl fmt::Debug for LockedText {
 }
 
 /// Read a file directly into locked memory.
-pub(crate) fn read_file_locked(path: &std::path::Path) -> Result<LockedText> {
+pub(crate) fn read_file_locked(path: &Path) -> Result<LockedText> {
     let mut file = std::fs::File::open(path)?;
     let size_hint = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
     let mut buf = LockedBuf::with_capacity(size_hint.saturating_add(1))?;
@@ -354,6 +395,93 @@ pub(crate) fn read_file_locked(path: &std::path::Path) -> Result<LockedText> {
         }
     }
     LockedText::from_utf8(buf)
+}
+
+enum EnvironmentSource {
+    Direct(String),
+    File {
+        file_variable: String,
+        path: PathBuf,
+    },
+}
+
+fn environment_source(name: &str) -> Result<Option<EnvironmentSource>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(EnvironmentSource::Direct(value))),
+        Err(error @ std::env::VarError::NotUnicode(_)) => {
+            Err(error).with_context(|| format!("Environment variable `{name}` is not valid UTF-8"))
+        }
+        Err(std::env::VarError::NotPresent) => {
+            let file_variable = format!("{name}_FILE");
+            match std::env::var(&file_variable) {
+                Ok(path) => Ok(Some(EnvironmentSource::File {
+                    file_variable,
+                    path: PathBuf::from(path),
+                })),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(file_error) => Err(file_error).with_context(|| {
+                    format!("Environment variable `{file_variable}` is not valid UTF-8")
+                }),
+            }
+        }
+    }
+}
+
+fn read_file_backed_locked(name: &str, file_variable: &str, path: &Path) -> Result<LockedText> {
+    read_file_locked(path)
+        .with_context(|| {
+            format!(
+                "Failed to read `{file_variable}` for environment variable `{name}` from `{}`",
+                path.display()
+            )
+        })
+        .map(LockedText::trim_terminal_line_endings)
+}
+
+fn read_file_backed(name: &str, file_variable: &str, path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "Failed to read `{file_variable}` for environment variable `{name}` from `{}`",
+            path.display()
+        )
+    })?;
+    let mut value = String::from_utf8(bytes).with_context(|| {
+        format!(
+            "`{file_variable}` for environment variable `{name}` at `{}` is not valid UTF-8",
+            path.display()
+        )
+    })?;
+    let trimmed_len = value
+        .trim_end_matches(|character| matches!(character, '\r' | '\n'))
+        .len();
+    value.truncate(trimmed_len);
+    Ok(value)
+}
+
+pub(crate) fn expand_environment(input: &str) -> Result<String> {
+    let mut deferred_error = None;
+    let expanded = shellexpand::env_with_context(input, |name| {
+        let value = match environment_source(name) {
+            Ok(Some(EnvironmentSource::Direct(value))) => Ok(Some(value)),
+            Ok(Some(EnvironmentSource::File {
+                file_variable,
+                path,
+            })) => read_file_backed(name, &file_variable, &path).map(Some),
+            Ok(None) => return Err(anyhow::anyhow!("environment variable not found")),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &value {
+            deferred_error.get_or_insert_with(|| format!("{error:#}"));
+        }
+        value
+    });
+
+    if let Some(error) = deferred_error {
+        return Err(anyhow::anyhow!(error));
+    }
+    expanded
+        .map(|expanded| expanded.into_owned())
+        .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 /// A fixed-size secret buffer stored in a pointer-stable locked allocation.
@@ -489,15 +617,22 @@ mod tests {
         );
     }
 
-    /// Differential parity with `shellexpand::env`, which still handles the
-    /// config's non-secret fields; the two implementations must not drift.
+    /// Differential parity with the ordinary config expansion path; the
+    /// locked parser and `shellexpand`-backed parser must not drift.
     #[test]
-    fn expansion_matches_shellexpand() {
+    fn password_expansion_matches_config_expansion() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::write(file.path(), "file-backed\r\n").unwrap();
         unsafe {
             std::env::set_var("ZEROFS_PARITY_SET", "value");
             std::env::set_var("ZEROFS_PARITY_EMPTY", "");
             std::env::set_var("ZEROFS_PARITY_µ", "mu");
             std::env::remove_var("ZEROFS_PARITY_UNSET");
+            std::env::remove_var("ZEROFS_PARITY_FILE_ONLY");
+            std::env::set_var("ZEROFS_PARITY_FILE_ONLY_FILE", file.path());
+            std::env::remove_var("ZEROFS_PARITY_BROKEN_FILE");
+            std::env::set_var("ZEROFS_PARITY_BROKEN_FILE_FILE", unreadable.path());
         }
 
         let corpus = [
@@ -509,6 +644,9 @@ mod tests {
             "$ZEROFS_PARITY_EMPTY",
             "${ZEROFS_PARITY_EMPTY:-default}",
             "${ZEROFS_PARITY_UNSET:-fallback}",
+            "${ZEROFS_PARITY_FILE_ONLY}",
+            "$ZEROFS_PARITY_FILE_ONLY",
+            "${ZEROFS_PARITY_BROKEN_FILE:-fallback}",
             "${ZEROFS_PARITY_UNSET:-}",
             "${ZEROFS_PARITY_UNSET:-$ZEROFS_PARITY_SET}",
             "$ZEROFS_PARITY_µ",
@@ -536,12 +674,12 @@ mod tests {
             let ours = EncryptionPassword::try_new(input)
                 .unwrap()
                 .expand_environment();
-            let theirs = shellexpand::env(input);
+            let theirs = expand_environment(input);
             match (&ours, &theirs) {
                 (Ok(ours), Ok(theirs)) => {
                     assert_eq!(
                         ours.expose_secret(),
-                        theirs.as_ref(),
+                        theirs.as_str(),
                         "diverged on {input:?}"
                     )
                 }
@@ -552,6 +690,26 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn file_backed_password_rejects_invalid_utf8_without_leaking_contents() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"must-not-appear-\xff").unwrap();
+        unsafe {
+            std::env::remove_var("ZEROFS_INVALID_PASSWORD_FILE_TEST");
+            std::env::set_var("ZEROFS_INVALID_PASSWORD_FILE_TEST_FILE", file.path());
+        }
+
+        let error = EncryptionPassword::try_new("${ZEROFS_INVALID_PASSWORD_FILE_TEST}")
+            .unwrap()
+            .expand_environment()
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("ZEROFS_INVALID_PASSWORD_FILE_TEST_FILE"));
+        assert!(error.contains(&file.path().display().to_string()));
+        assert!(error.contains("UTF-8"));
+        assert!(!error.contains("must-not-appear"));
     }
 
     #[test]
