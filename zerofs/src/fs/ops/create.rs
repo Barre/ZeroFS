@@ -125,6 +125,14 @@ impl ZeroFS {
                     }
                 };
 
+                // Match chmod: non-root callers cannot set SGID for a group
+                // they do not belong to, including an inherited parent group.
+                let final_mode = if creds.uid != 0 && !creds.is_member_of_group(new_gid) {
+                    final_mode & !0o2000
+                } else {
+                    final_mode
+                };
+
                 let file_inode = Inode::File(FileInode {
                     size: 0,
                     mtime: now_sec,
@@ -537,6 +545,12 @@ impl ZeroFS {
                     }
                 };
 
+                let final_mode = if creds.uid != 0 && !creds.is_member_of_group(new_gid) {
+                    final_mode & !0o2000
+                } else {
+                    final_mode
+                };
+
                 let special_inode = SpecialInode {
                     mtime: now_sec,
                     mtime_nsec: now_nsec,
@@ -643,7 +657,7 @@ mod tests {
     use crate::fs::*;
     use crate::test_helpers::test_helpers_mod::test_auth;
 
-    use crate::fs::inode::Inode;
+    use crate::fs::inode::{Inode, InodeAttrs};
     use crate::fs::key_codec::KeyCodec;
 
     use crate::fs::types::{FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid};
@@ -907,6 +921,82 @@ mod tests {
             .await
             .unwrap();
         id
+    }
+
+    #[tokio::test]
+    async fn create_and_mknod_strip_sgid_for_non_members() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let dir = setgid_dir(&fs, b"sgid-mode").await;
+        let non_member = test_creds();
+        let mut supplementary_member = non_member;
+        supplementary_member.groups[0] = SETGID_PARENT_GID;
+        supplementary_member.groups_count = 1;
+        let primary_member = non_member.with_gid(SETGID_PARENT_GID);
+        let mut root = non_member;
+        root.uid = 0;
+        let mut incomplete_groups = non_member;
+        incomplete_groups.groups_complete = false;
+
+        // Explicit gids must be checked instead of the setgid parent's gid.
+        let cases = [
+            ("non_member", non_member, SetGid::NoChange, 2000, false),
+            (
+                "primary_member",
+                primary_member,
+                SetGid::NoChange,
+                2000,
+                true,
+            ),
+            (
+                "supplementary_member",
+                supplementary_member,
+                SetGid::NoChange,
+                2000,
+                true,
+            ),
+            ("root", root, SetGid::NoChange, 2000, true),
+            (
+                "incomplete_groups",
+                incomplete_groups,
+                SetGid::NoChange,
+                2000,
+                true,
+            ),
+            ("explicit_member", non_member, SetGid::Set(1000), 1000, true),
+            (
+                "explicit_non_member",
+                primary_member,
+                SetGid::Set(4242),
+                4242,
+                false,
+            ),
+        ];
+
+        for (name, creds, gid, expected_gid, keep_sgid) in cases {
+            let attr = SetAttributes {
+                mode: SetMode::Set(0o2755),
+                gid,
+                ..Default::default()
+            };
+            for is_mknod in [false, true] {
+                let entry = format!("{name}-{}", if is_mknod { "fifo" } else { "file" });
+                let (id, attrs) = if is_mknod {
+                    fs.mknod(&creds, dir, entry.as_bytes(), FileType::Fifo, &attr, None)
+                        .await
+                        .unwrap()
+                } else {
+                    fs.create(&creds, dir, entry.as_bytes(), &attr)
+                        .await
+                        .unwrap()
+                };
+                let expected_mode = if keep_sgid { 0o2755 } else { 0o755 };
+                assert_eq!(attrs.gid, expected_gid, "{entry}");
+                assert_eq!(attrs.mode, expected_mode, "{entry}");
+                let inode = fs.inode_store.get(id).await.unwrap();
+                assert_eq!(inode.gid(), expected_gid, "stored {entry}");
+                assert_eq!(inode.mode(), expected_mode, "stored {entry}");
+            }
+        }
     }
 
     #[tokio::test]
