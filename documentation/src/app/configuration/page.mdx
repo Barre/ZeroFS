@@ -285,6 +285,8 @@ ZeroFS compresses each 32 KiB extent of file data before encrypting it; the resu
 compression = "zstd-3"   # Zstd at level 3 (default)
 # or
 compression = "lz4"      # Fast compression, lower ratio
+# or
+compression = "none"     # No compression
 ```
 
 ### Algorithms
@@ -292,6 +294,8 @@ compression = "lz4"      # Fast compression, lower ratio
 - **`zstd-{level}`** (default: `zstd-3`): Zstandard compression with configurable level from 1 to 22. Lower levels (1-5) are faster, higher levels (15-22) achieve better compression but are slower.
 
 - **`lz4`**: Very fast compression and decompression with moderate compression ratio. Prefer for write-throughput-bound workloads where compression CPU is the bottleneck.
+
+- **`none`**: No compression. Use it when the filesystem holds incompressible data (already compressed archives, media, encrypted files): a codec would spend CPU without saving space. Data is only copied into the frame, stored as an lz4 block of uncompressed literals, so it reads back through the lz4 decoder.
 
 ### Changing Compression
 

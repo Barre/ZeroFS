@@ -88,7 +88,7 @@ impl FrameCodec {
     /// Whether encoding is cheap enough to run inline rather than on a blocking thread.
     pub fn encode_is_cheap(&self) -> bool {
         match self.compression {
-            CompressionConfig::Lz4 => true,
+            CompressionConfig::Lz4 | CompressionConfig::None => true,
             CompressionConfig::Zstd(level) => level <= 12,
         }
     }
@@ -100,6 +100,9 @@ impl FrameCodec {
                 .saturating_add(std::mem::size_of::<u32>()),
             CompressionConfig::Zstd(_) => zstd::zstd_safe::compress_bound(payload_size)
                 .saturating_add(std::mem::size_of::<u32>()),
+            CompressionConfig::None => {
+                lz4_literals_size(payload_size).saturating_add(std::mem::size_of::<u32>())
+            }
         };
         u64::try_from(compressed)
             .unwrap_or(u64::MAX)
@@ -199,6 +202,7 @@ impl FrameCodec {
                 dest.set_position((NONCE_SIZE + 4) as u64);
                 zstd_compress(data, level, &mut dest)?;
             }
+            CompressionConfig::None => lz4_literals(data, &mut out),
         }
         // Release excess capacity, keeping room for the authentication tag.
         out.shrink_to(out.len() + TAG_SIZE);
@@ -217,6 +221,31 @@ impl FrameCodec {
                 .map_err(|e| CodecError::Decompress(e.to_string()))
         }
     }
+}
+
+/// Bytes of an lz4 block holding `len` bytes as one run of literals.
+fn lz4_literals_size(len: usize) -> usize {
+    1 + if len >= 15 { (len - 15) / 255 + 1 } else { 0 } + len
+}
+
+/// Appends `data` as an lz4 block of one literal run and no match: the last
+/// sequence of an lz4 block may carry literals only, so any lz4 decoder
+/// reads it back. Token: literal length in the high nibble, 15 meaning
+/// "more bytes follow" (255 each, then the remainder).
+fn lz4_literals(data: &[u8], out: &mut Vec<u8>) {
+    let len = data.len();
+    if len < 15 {
+        out.push((len as u8) << 4);
+    } else {
+        out.push(0xF0);
+        let mut rest = len - 15;
+        while rest >= 255 {
+            out.push(255);
+            rest -= 255;
+        }
+        out.push(rest as u8);
+    }
+    out.extend_from_slice(data);
 }
 
 /// Compress via a thread-local reused zstd context: creating a context per
@@ -258,9 +287,32 @@ mod tests {
             .expect("test key should be lockable")
     }
 
+    /// `none` writes an lz4 block of one literal run: the lz4 decoder reads
+    /// it back at every length around the token and length-byte boundaries,
+    /// and the size bound is exact.
+    #[test]
+    fn none_is_a_literal_lz4_block() {
+        let c = FrameCodec::try_new(&[7u8; 32], b"none", CompressionConfig::None)
+            .expect("test key should be lockable");
+        for len in [0, 1, 14, 15, 16, 269, 270, 271, 524, 525, 32768, 32769] {
+            let plain: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let Compressed(raw) = c.compress(&plain).unwrap();
+            let payload = &raw[NONCE_SIZE..];
+            assert_eq!(payload.len(), 4 + lz4_literals_size(len), "len {len}");
+            assert_eq!(c.decompress(payload).unwrap(), plain, "len {len}");
+            let sealed = c.seal(&plain, b"aad").unwrap();
+            assert_eq!(sealed.len() as u64, c.max_sealed_size(len), "len {len}");
+            assert_eq!(c.open(&sealed, b"aad").unwrap(), plain, "len {len}");
+        }
+    }
+
     #[test]
     fn owned_and_shared_frames_preserve_authentication_and_cached_ciphertext() {
-        for compression in [CompressionConfig::Lz4, CompressionConfig::Zstd(3)] {
+        for compression in [
+            CompressionConfig::Lz4,
+            CompressionConfig::Zstd(3),
+            CompressionConfig::None,
+        ] {
             let c = FrameCodec::try_new(&[7; 32], b"decode-ownership", compression).unwrap();
             let plain = vec![0x5a; 32768];
             let sealed = c.seal(&plain, b"correct aad").unwrap();
@@ -294,6 +346,8 @@ mod tests {
             codec(),
             FrameCodec::try_new(&[7u8; 32], b"frame-codec-test", CompressionConfig::Zstd(3))
                 .expect("test key should be lockable"),
+            FrameCodec::try_new(&[7u8; 32], b"frame-codec-test", CompressionConfig::None)
+                .expect("test key should be lockable"),
         ] {
             let mut random = vec![0; 40_000];
             rand::rngs::StdRng::seed_from_u64(7).fill_bytes(&mut random);
@@ -303,6 +357,11 @@ mod tests {
                     CompressionConfig::Zstd(level) => {
                         let mut bytes = (plain.len() as u32).to_le_bytes().to_vec();
                         bytes.extend(zstd::bulk::compress(&plain, level).unwrap());
+                        bytes
+                    }
+                    CompressionConfig::None => {
+                        let mut bytes = (plain.len() as u32).to_le_bytes().to_vec();
+                        lz4_literals(&plain, &mut bytes);
                         bytes
                     }
                 };

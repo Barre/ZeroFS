@@ -31,7 +31,7 @@ ZeroFS differentiates itself from other "filesystem on S3" projects by:
 | **File access** | NFS and 9P servers. Use the native kernel client when DKMS can install it for the running kernel, or `zerofs mount` as a fallback. |
 | **Block access** | NBD devices with TRIM. FLUSH and FUA replies return only after data is durable. |
 | **Encryption** | Extents are encrypted with XChaCha20-Poly1305. Data key wrapped via Argon2id. |
-| **Compression** | zstd or lz4, before encryption. Codec changeable at any time without migration. |
+| **Compression** | zstd, lz4 or none, before encryption. Codec changeable at any time without migration. |
 | **Caching** | Memory and disk tiers. |
 | **High availability** | Optional leader/standby over the same bucket for automatic failover. |
 | **Web UI** | File manager, dashboard, in-browser terminal. |
@@ -206,7 +206,7 @@ encryption_password = "${ZEROFS_PASSWORD}"
 
 [filesystem]
 max_size_gb = 100.0     # Optional; writes past the quota return ENOSPC (default 16 EiB)
-compression = "zstd-3"  # Optional: "zstd-{1-22}" (default "zstd-3") or "lz4"
+compression = "zstd-3"  # Optional: "zstd-{1-22}" (default "zstd-3"), "lz4" or "none"
 
 [servers.nfs]
 addresses = ["127.0.0.1:2049"]

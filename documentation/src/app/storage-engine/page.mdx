@@ -176,7 +176,7 @@ The engine responds to these configuration keys:
 
 | Key | Default | Effect |
 |-----|---------|--------|
-| `[filesystem] compression` | `zstd-3` | Per-frame codec: `lz4` or `zstd-1` through `zstd-22`. The algorithm is auto-detected on read, so changing it on an existing store is safe; old and new frames coexist. |
+| `[filesystem] compression` | `zstd-3` | Per-frame codec: `lz4`, `zstd-1` through `zstd-22`, or `none` (an lz4 block of uncompressed literals). The algorithm is auto-detected on read, so changing it on an existing store is safe; old and new frames coexist. |
 | `[filesystem] ignore_fsync` | `false` | Client fsync returns without a seal and flush. Intended for [HA](/high-availability), where the standby already holds the write. Cannot be combined with `sync_writes`. |
 | `[lsm] flush_interval_secs` | `30` (min 5) | Interval of the periodic barrier-gated flush: seal the open segment, then flush metadata. |
 | `[lsm] sync_writes` | `false` | Forces a segment seal and metadata flush after every coalesced commit batch. Expensive because each batch waits for a full seal plus memtable flush. |

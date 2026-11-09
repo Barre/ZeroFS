@@ -17,6 +17,11 @@ pub enum CompressionConfig {
     /// Zstd compression with configurable level (1-22)
     /// Level 1 is fastest, level 22 is maximum compression
     Zstd(i32),
+    /// No compression, for filesystems that hold incompressible data. Each
+    /// frame is stored as an lz4 block made of a single literal run: writing
+    /// it costs a copy instead of a compressor pass, and the existing lz4
+    /// decoder reads it back, so the frame format does not change.
+    None,
 }
 
 impl Default for CompressionConfig {
@@ -33,6 +38,7 @@ impl Serialize for CompressionConfig {
         match self {
             CompressionConfig::Lz4 => serializer.serialize_str("lz4"),
             CompressionConfig::Zstd(level) => serializer.serialize_str(&format!("zstd-{}", level)),
+            CompressionConfig::None => serializer.serialize_str("none"),
         }
     }
 }
@@ -48,7 +54,7 @@ impl<'de> Deserialize<'de> for CompressionConfig {
             type Value = CompressionConfig;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("'zstd-{level}' where level is 1-22, or 'lz4'")
+                formatter.write_str("'zstd-{level}' where level is 1-22, 'lz4', or 'none'")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<CompressionConfig, E>
@@ -57,6 +63,9 @@ impl<'de> Deserialize<'de> for CompressionConfig {
             {
                 if value == "lz4" {
                     return Ok(CompressionConfig::Lz4);
+                }
+                if value == "none" {
+                    return Ok(CompressionConfig::None);
                 }
 
                 if let Some(level_str) = value.strip_prefix("zstd-") {
@@ -79,7 +88,7 @@ impl<'de> Deserialize<'de> for CompressionConfig {
 
                 Err(de::Error::invalid_value(
                     de::Unexpected::Str(value),
-                    &"'zstd-{level}' where level is 1-22, or 'lz4'",
+                    &"'zstd-{level}' where level is 1-22, 'lz4', or 'none'",
                 ))
             }
         }
@@ -992,6 +1001,9 @@ impl Settings {
         );
         toml_string.push_str("#     Level 1 is fastest, level 22 is maximum compression\n");
         toml_string.push_str("#   - \"lz4\": Faster compression, lower ratio (prefer for write-throughput-bound workloads)\n");
+        toml_string.push_str(
+            "#   - \"none\": No compression (for filesystems holding incompressible data)\n",
+        );
         toml_string.push_str("#\n");
         toml_string
             .push_str("# Note: Compression can be changed at any time. Existing data remains\n");
@@ -1616,6 +1628,7 @@ sync_writes = true"#,
     fn compression_config_parses_valid_strings() {
         let parse = |s: &str| serde_json::from_str::<CompressionConfig>(s).unwrap();
         assert_eq!(parse("\"lz4\""), CompressionConfig::Lz4);
+        assert_eq!(parse("\"none\""), CompressionConfig::None);
         assert_eq!(parse("\"zstd-1\""), CompressionConfig::Zstd(1));
         assert_eq!(parse("\"zstd-22\""), CompressionConfig::Zstd(22));
     }
