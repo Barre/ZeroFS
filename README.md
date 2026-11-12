@@ -93,7 +93,7 @@ zerofs run -c zerofs.toml
 [`kernel/`](kernel/) contains an out-of-tree VFS module that speaks the private
 `9P2000.L.Z` dialect over TCP or AF_UNIX, without FUSE or Linux v9fs. It
 supports x86-64 and little-endian arm64. See the
-[native kernel client guide](https://www.zerofs.net/kernel-client).
+[native kernel client guide](https://www.zerofs.net/docs/kernel-client).
 
 ## Testing
 
