@@ -8,12 +8,10 @@ use fp::fail_point;
 use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId, SymlinkInode};
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::{AccessMode, Credentials, check_access, new_entry_gid};
 use crate::fs::store::inode::MAX_HARDLINKS_PER_INODE;
 use crate::fs::tracing::FileOperation;
-use crate::fs::types::{
-    AuthContext, FileAttributes, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
-};
+use crate::fs::types::{AuthContext, FileAttributes, InodeWithId, SetAttributes, SetMode, SetUid};
 use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{ZeroFS, get_current_time, validate_filename};
 use ::tracing::debug;
@@ -94,19 +92,7 @@ impl ZeroFS {
             SetUid::NoChange => creds.uid,
         };
 
-        // BSD group semantics: a setgid parent directory makes new entries
-        // inherit its group, symlinks included. The setgid bit itself is not
-        // inherited, matching Linux.
-        let gid = match &attr.gid {
-            SetGid::Set(g) => *g,
-            SetGid::NoChange => {
-                if dir.mode & 0o2000 != 0 {
-                    dir.gid
-                } else {
-                    creds.gid
-                }
-            }
-        };
+        let gid = new_entry_gid(dir, &attr.gid, creds);
 
         let (now_sec, now_nsec) = get_current_time();
         let symlink_inode = Inode::Symlink(SymlinkInode {
@@ -868,7 +854,6 @@ mod tests {
             .await
             .unwrap();
 
-        // test_creds has gid 1000, so 2000 can only have come from the parent.
         assert_eq!(attrs.gid, 2000, "symlink should inherit the setgid group");
     }
 
@@ -901,8 +886,6 @@ mod tests {
             .await
             .unwrap();
 
-        // A hard link shares the inode, so it keeps the source's group
-        // rather than picking up the setgid parent's.
         fs.link(&(&test_auth()).into(), src, dir, b"hard")
             .await
             .unwrap();

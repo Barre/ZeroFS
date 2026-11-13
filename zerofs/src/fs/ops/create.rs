@@ -10,11 +10,12 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::{
     DirectoryInode, FileInode, Inode, InodeId, MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR, SpecialInode,
 };
-use crate::fs::permissions::{AccessMode, Credentials, check_access, validate_mode};
+use crate::fs::permissions::{
+    AccessMode, Credentials, check_access, new_entry_gid, strip_sgid_unless_member, validate_mode,
+};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
-    AuthContext, FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetTime,
-    SetUid,
+    AuthContext, FileAttributes, FileType, InodeWithId, SetAttributes, SetMode, SetTime, SetUid,
 };
 use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{ZeroFS, get_current_time, validate_filename};
@@ -102,36 +103,15 @@ impl ZeroFS {
 
                 let (now_sec, now_nsec) = get_current_time();
 
-                let final_mode = match &attr.mode {
-                    SetMode::Set(m) => validate_mode(*m),
-                    SetMode::NoChange => 0o666,
-                };
-
-                // BSD group semantics: a setgid parent directory makes new
-                // entries inherit its group. Only directories additionally
-                // inherit the setgid bit itself, so that the group keeps
-                // applying to their own children; a regular file does not,
-                // which matches Linux.
-                let parent_is_setgid = dir.mode & 0o2000 != 0;
-
-                let new_gid = match &attr.gid {
-                    SetGid::Set(g) => *g,
-                    SetGid::NoChange => {
-                        if parent_is_setgid {
-                            dir.gid
-                        } else {
-                            creds.gid
-                        }
-                    }
-                };
-
-                // Match chmod: non-root callers cannot set SGID for a group
-                // they do not belong to, including an inherited parent group.
-                let final_mode = if creds.uid != 0 && !creds.is_member_of_group(new_gid) {
-                    final_mode & !0o2000
-                } else {
-                    final_mode
-                };
+                let new_gid = new_entry_gid(dir, &attr.gid, creds);
+                let final_mode = strip_sgid_unless_member(
+                    match &attr.mode {
+                        SetMode::Set(m) => validate_mode(*m),
+                        SetMode::NoChange => 0o666,
+                    },
+                    new_gid,
+                    creds,
+                );
 
                 let file_inode = Inode::File(FileInode {
                     size: 0,
@@ -310,8 +290,7 @@ impl ZeroFS {
                     SetMode::NoChange => 0o777,
                 };
 
-                let parent_mode = dir.mode;
-                if parent_mode & 0o2000 != 0 {
+                if dir.mode & 0o2000 != 0 {
                     new_mode |= 0o2000;
                 }
 
@@ -320,16 +299,7 @@ impl ZeroFS {
                     SetUid::NoChange => creds.uid,
                 };
 
-                let new_gid = match &attr.gid {
-                    SetGid::Set(g) => *g,
-                    SetGid::NoChange => {
-                        if parent_mode & 0o2000 != 0 {
-                            dir.gid
-                        } else {
-                            creds.gid
-                        }
-                    }
-                };
+                let new_gid = new_entry_gid(dir, &attr.gid, creds);
 
                 let (atime_sec, atime_nsec) = match &attr.atime {
                     SetTime::SetToClientTime(ts) => (ts.seconds, ts.nanoseconds),
@@ -523,33 +493,16 @@ impl ZeroFS {
                     _ => return Err(FsError::InvalidArgument),
                 };
 
-                let final_mode = if let SetMode::Set(m) = attr.mode {
-                    validate_mode(m)
-                } else {
-                    base_mode
-                };
-
-                // BSD group semantics: a setgid parent directory makes new
-                // entries inherit its group. See `create` for why the bit
-                // itself is not inherited here.
-                let parent_is_setgid = dir.mode & 0o2000 != 0;
-
-                let new_gid = match attr.gid {
-                    SetGid::Set(g) => g,
-                    _ => {
-                        if parent_is_setgid {
-                            dir.gid
-                        } else {
-                            creds.gid
-                        }
-                    }
-                };
-
-                let final_mode = if creds.uid != 0 && !creds.is_member_of_group(new_gid) {
-                    final_mode & !0o2000
-                } else {
-                    final_mode
-                };
+                let new_gid = new_entry_gid(dir, &attr.gid, creds);
+                let final_mode = strip_sgid_unless_member(
+                    if let SetMode::Set(m) = attr.mode {
+                        validate_mode(m)
+                    } else {
+                        base_mode
+                    },
+                    new_gid,
+                    creds,
+                );
 
                 let special_inode = SpecialInode {
                     mtime: now_sec,
@@ -899,13 +852,9 @@ mod tests {
         );
     }
 
-    /// Group of the directories built by `setgid_dir`. Deliberately different from
-    /// `test_creds`'s gid of 1000 so that inheritance is observable: a file that
-    /// comes out 2000 can only have got it from the parent directory.
+    /// Differs from `test_creds`'s gid so inheritance is observable.
     const SETGID_PARENT_GID: u32 = 2000;
 
-    /// Creates a setgid directory owned by `SETGID_PARENT_GID` under the root
-    /// inode and returns its id.
     async fn setgid_dir(fs: &ZeroFS, name: &[u8]) -> InodeId {
         let (id, _) = fs
             .mkdir(
@@ -937,7 +886,6 @@ mod tests {
         let mut incomplete_groups = non_member;
         incomplete_groups.groups_complete = false;
 
-        // Explicit gids must be checked instead of the setgid parent's gid.
         let cases = [
             ("non_member", non_member, SetGid::NoChange, 2000, false),
             (
@@ -1004,7 +952,6 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let dir = setgid_dir(&fs, b"sgid").await;
 
-        // No explicit gid, so the setgid parent's group wins over creds.gid.
         let (_, attrs) = fs
             .create(&test_creds(), dir, b"file", &SetAttributes::default())
             .await
@@ -1067,8 +1014,6 @@ mod tests {
             .await
             .unwrap();
 
-        // mkdir propagates the setgid bit into its own children, so the
-        // inheritance has to survive a second level.
         assert_eq!(
             inner_attrs.mode & 0o2000,
             0o2000,
