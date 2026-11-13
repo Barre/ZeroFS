@@ -93,6 +93,7 @@ jobs:
             sudo apt-get install -y fuse3
           elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
             sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz parallel
+            sudo modprobe nbd
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
             sudo apt-get install -y nfs-common
           fi
@@ -263,7 +264,8 @@ jobs:
             sudo mkdir -p /mnt/zerofs/.nbd
             sudo truncate -s 3G /mnt/zerofs/.nbd/test-device
             sudo umount /mnt/zerofs
-            sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
+            sudo udevadm settle
+            sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device || { sudo dmesg | tail -50; exit 1; }
             sudo zpool create testpool /dev/nbd0
             sudo zfs create testpool/data
             sudo zfs set mountpoint=/mnt/zfsdata testpool/data

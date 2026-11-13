@@ -21,6 +21,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz parallel
+          sudo modprobe nbd
 
       - name: Fetch the prebuilt ZeroFS binary
         uses: actions/download-artifact@v4
@@ -96,7 +97,8 @@ jobs:
       - name: Connect NBD device
         run: |
           echo "Connecting to NBD device..."
-          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
+          sudo udevadm settle
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device || { sudo dmesg | tail -50; exit 1; }
 
           sudo blockdev --getsize64 /dev/nbd0
           sudo fdisk -l /dev/nbd0
