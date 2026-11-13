@@ -130,19 +130,19 @@ jobs:
       - name: Download and extract Linux kernel
         run: |
           # Download Linux kernel source
-          echo "Downloading Linux kernel 7.2-rc1..."
+          echo "Downloading Linux kernel 7.2..."
           cd /mnt/zfsdata
-          sudo wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+          sudo wget -q https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.tar.gz
 
           # Show download size
-          ls -lh linux-7.2-rc1.tar.gz
+          ls -lh linux-7.2.tar.gz
 
           echo "Extracting kernel source..."
-          time sudo tar -I pigz -xf linux-7.2-rc1.tar.gz
+          time sudo tar -I pigz -xf linux-7.2.tar.gz
 
           # Count files to verify extraction
           echo "Counting extracted files..."
-          sudo find linux-7.2-rc1 -type f | wc -l
+          sudo find linux-7.2 -type f | wc -l
 
       - name: Test ZFS operations
         run: |

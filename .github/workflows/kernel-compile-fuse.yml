@@ -108,13 +108,13 @@ jobs:
       - name: Download Linux kernel
         run: |
           cd /mnt/zerofs
-          wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
-          tar -xf linux-7.2-rc1.tar.gz
-          rm linux-7.2-rc1.tar.gz
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.tar.gz
+          tar -xf linux-7.2.tar.gz
+          rm linux-7.2.tar.gz
 
       - name: Compile kernel
         run: |
-          cd /mnt/zerofs/linux-7.2-rc1
+          cd /mnt/zerofs/linux-7.2
 
           # Configure with tinyconfig for minimal build
           make tinyconfig
