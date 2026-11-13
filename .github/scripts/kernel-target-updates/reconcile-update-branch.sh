@@ -70,30 +70,30 @@ if [[ -n "$remote_sha" ]]; then
   fi
   pending_parent=${pending_parents[0]}
   if ! git merge-base --is-ancestor "$pending_parent" "$BASE_SHA"; then
-    echo "update branch parent is not an ancestor of BASE_SHA" >&2
-    exit 1
-  fi
+    echo "discarding update branch $remote_sha: parent $pending_parent" \
+      "is not an ancestor of BASE_SHA" >&2
+  else
+    mapfile -t pending_paths < <(
+      git diff-tree --no-commit-id --name-only -r "$remote_sha" --
+    )
+    if ((${#pending_paths[@]} != 1)) ||
+       [[ "${pending_paths[0]}" != "$manifest" ]]; then
+      echo "update branch must change only $manifest" >&2
+      printf 'changed path: %s\n' "${pending_paths[@]}" >&2
+      exit 1
+    fi
 
-  mapfile -t pending_paths < <(
-    git diff-tree --no-commit-id --name-only -r "$remote_sha" --
-  )
-  if ((${#pending_paths[@]} != 1)) ||
-     [[ "${pending_paths[0]}" != "$manifest" ]]; then
-    echo "update branch must change only $manifest" >&2
-    printf 'changed path: %s\n' "${pending_paths[@]}" >&2
-    exit 1
+    pending_dir=$(mktemp -d)
+    trap 'rm -rf -- "$pending_dir"' EXIT
+    pending_base=$pending_dir/base.json
+    pending_head=$pending_dir/head.json
+    git show "$pending_parent:$manifest" >"$pending_base"
+    git show "$remote_sha:$manifest" >"$pending_head"
+    pending_arguments=(
+      --pending-base "$pending_base"
+      --pending-head "$pending_head"
+    )
   fi
-
-  pending_dir=$(mktemp -d)
-  trap 'rm -rf -- "$pending_dir"' EXIT
-  pending_base=$pending_dir/base.json
-  pending_head=$pending_dir/head.json
-  git show "$pending_parent:$manifest" >"$pending_base"
-  git show "$remote_sha:$manifest" >"$pending_head"
-  pending_arguments=(
-    --pending-base "$pending_base"
-    --pending-head "$pending_head"
-  )
 fi
 
 packaging/kernel/kernel-targets.py \
