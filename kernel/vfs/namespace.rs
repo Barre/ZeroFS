@@ -31,7 +31,7 @@ use super::{
         mark_spliced_dentry_observed, monotonic_now_ns, protocol_error, publish_mutation_stat,
         validate_stat, validate_stat_for_inode,
     },
-    compat,
+    compat::{self, IdmapArg},
     inode::get_inode,
     io::{
         DelayedCallRef, DentryRef, FileOpenRef, InodeRef, KstatOut, NameDentryRef, OpenFileRef,
@@ -117,13 +117,14 @@ fn lookup_entry(
     Ok(result)
 }
 
-pub(super) unsafe extern "C" fn zerofs_getattr(
-    idmap: *mut bindings::mnt_idmap,
+pub(super) unsafe extern "C" fn zerofs_getattr<I: IdmapArg>(
+    idmap: I,
     path: *const bindings::path,
     output: *mut bindings::kstat,
     request_mask: u32,
     query_flags: ffi::c_uint,
 ) -> ffi::c_int {
+    let idmap = idmap.into_raw();
     from_result(|| {
         // SAFETY: VFS lends this callback exclusive output storage.
         let mut output = unsafe { KstatOut::from_raw(output) }?;
@@ -240,11 +241,12 @@ pub(super) unsafe extern "C" fn zerofs_getattr(
     })
 }
 
-pub(super) unsafe extern "C" fn zerofs_permission(
-    idmap: *mut bindings::mnt_idmap,
+pub(super) unsafe extern "C" fn zerofs_permission<I: IdmapArg>(
+    idmap: I,
     inode: *mut bindings::inode,
     mask: ffi::c_int,
 ) -> ffi::c_int {
+    let idmap = idmap.into_raw();
     from_result(|| {
         // SAFETY: VFS retains this inode for the duration of the check.
         let inode = unsafe { InodeRef::from_raw(inode) }?;
@@ -290,11 +292,12 @@ pub(super) unsafe extern "C" fn zerofs_permission(
     })
 }
 
-pub(super) unsafe extern "C" fn zerofs_setattr(
-    idmap: *mut bindings::mnt_idmap,
+pub(super) unsafe extern "C" fn zerofs_setattr<I: IdmapArg>(
+    idmap: I,
     dentry: *mut bindings::dentry,
     attributes: *mut bindings::iattr,
 ) -> ffi::c_int {
+    let idmap = idmap.into_raw();
     from_result(|| {
         // SAFETY: VFS supplies a positive dentry and holds the target inode's
         // i_rwsem across notify_change() and this callback. Most callers hold
@@ -680,8 +683,8 @@ fn invalidate_new_entry_attempt(
     expire_cached_attributes_at(parent, generation);
 }
 
-pub(super) unsafe extern "C" fn zerofs_create(
-    _idmap: *mut bindings::mnt_idmap,
+pub(super) unsafe extern "C" fn zerofs_create<I: IdmapArg>(
+    _idmap: I,
     parent: *mut bindings::inode,
     dentry: *mut bindings::dentry,
     mode: bindings::umode_t,
@@ -867,8 +870,8 @@ pub(super) unsafe extern "C" fn zerofs_atomic_open(
     })
 }
 
-pub(super) unsafe extern "C" fn zerofs_mkdir(
-    _idmap: *mut bindings::mnt_idmap,
+pub(super) unsafe extern "C" fn zerofs_mkdir<I: IdmapArg>(
+    _idmap: I,
     parent: *mut bindings::inode,
     dentry: *mut bindings::dentry,
     mode: bindings::umode_t,
@@ -932,8 +935,8 @@ fn create_directory_entry(
     Ok(result)
 }
 
-pub(super) unsafe extern "C" fn zerofs_symlink(
-    _idmap: *mut bindings::mnt_idmap,
+pub(super) unsafe extern "C" fn zerofs_symlink<I: IdmapArg>(
+    _idmap: I,
     parent: *mut bindings::inode,
     dentry: *mut bindings::dentry,
     target: *const ffi::c_char,
@@ -960,8 +963,8 @@ fn create_symlink_entry(entry: NewEntryContext<'_>, target: &[u8]) -> Result<()>
     entry.finish_non_directory(result, bindings::S_IFLNK)
 }
 
-pub(super) unsafe extern "C" fn zerofs_mknod(
-    _idmap: *mut bindings::mnt_idmap,
+pub(super) unsafe extern "C" fn zerofs_mknod<I: IdmapArg>(
+    _idmap: I,
     parent: *mut bindings::inode,
     dentry: *mut bindings::dentry,
     mode: bindings::umode_t,
@@ -1180,8 +1183,8 @@ pub(super) unsafe extern "C" fn zerofs_rmdir(
     })
 }
 
-pub(super) unsafe extern "C" fn zerofs_rename(
-    _idmap: *mut bindings::mnt_idmap,
+pub(super) unsafe extern "C" fn zerofs_rename<I: IdmapArg>(
+    _idmap: I,
     old_parent: *mut bindings::inode,
     old_dentry: *mut bindings::dentry,
     new_parent: *mut bindings::inode,

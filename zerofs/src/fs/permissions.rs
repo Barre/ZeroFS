@@ -56,12 +56,7 @@ impl Credentials {
         if self.gid_known && self.gid == gid {
             return true;
         }
-        for i in 0..self.groups_count {
-            if self.groups[i] == gid {
-                return true;
-            }
-        }
-        false
+        self.groups[..self.groups_count].contains(&gid)
     }
 }
 

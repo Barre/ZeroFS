@@ -168,9 +168,9 @@ impl AccessHistory {
     fn weakest_slot(&self) -> usize {
         let mut min_idx = 0;
         let mut min_window = usize::MAX;
-        for i in 0..self.len {
-            if self.streams[i].fetch_window < min_window {
-                min_window = self.streams[i].fetch_window;
+        for (i, s) in self.streams[..self.len].iter().enumerate() {
+            if s.fetch_window < min_window {
+                min_window = s.fetch_window;
                 min_idx = i;
             }
         }
@@ -184,8 +184,7 @@ impl AccessHistory {
     fn find_stream(&self, offset: u64) -> Option<usize> {
         let mut best = None;
         let mut best_dist = u64::MAX;
-        for i in 0..self.len {
-            let s = &self.streams[i];
+        for (i, s) in self.streams[..self.len].iter().enumerate() {
             if offset >= s.last_offset && offset.saturating_sub(s.last_end) <= self.stride_limit {
                 let dist = offset.saturating_sub(s.last_end);
                 if dist < best_dist {
@@ -207,8 +206,7 @@ impl AccessHistory {
         let slack = len.saturating_mul(8);
         let mut best = None;
         let mut best_lag = u64::MAX;
-        for i in 0..self.len {
-            let s = &self.streams[i];
+        for (i, s) in self.streams[..self.len].iter().enumerate() {
             if offset < s.last_offset {
                 let lag = s.last_offset - offset;
                 if lag <= slack && lag < best_lag {

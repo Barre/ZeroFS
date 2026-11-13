@@ -3,37 +3,58 @@
 
 use kernel::bindings;
 
+/// The mount idmap argument of an inode operation. Linux 7.4 made it a const
+/// pointer; callbacks are generic over both spellings so each instantiates to
+/// the target's generated signature.
+pub(crate) trait IdmapArg: Copy {
+    /// The mutable spelling, which coerces to either form of the target's idmap
+    /// helper parameters. ZeroFS only forwards the idmap and never writes it.
+    fn into_raw(self) -> *mut bindings::mnt_idmap;
+}
+
+impl IdmapArg for *mut bindings::mnt_idmap {
+    fn into_raw(self) -> *mut bindings::mnt_idmap {
+        self
+    }
+}
+
+impl IdmapArg for *const bindings::mnt_idmap {
+    fn into_raw(self) -> *mut bindings::mnt_idmap {
+        self.cast_mut()
+    }
+}
+
 /// Select the create callback from the target's generated VFS signature.
 /// Linux 7.3 removed the final `exclusive` argument, which ZeroFS never used.
 pub(super) trait CreateCallback {
     const CALLBACK: Self;
 }
 
-impl CreateCallback
+impl<I: IdmapArg> CreateCallback
     for unsafe extern "C" fn(
-        *mut bindings::mnt_idmap,
+        I,
         *mut bindings::inode,
         *mut bindings::dentry,
         bindings::umode_t,
     ) -> kernel::ffi::c_int
 {
-    const CALLBACK: Self = super::namespace::zerofs_create;
+    const CALLBACK: Self = super::namespace::zerofs_create::<I>;
 }
 
-impl CreateCallback
+impl<I: IdmapArg> CreateCallback
     for unsafe extern "C" fn(
-        *mut bindings::mnt_idmap,
+        I,
         *mut bindings::inode,
         *mut bindings::dentry,
         bindings::umode_t,
         bindings::bool_,
     ) -> kernel::ffi::c_int
 {
-    const CALLBACK: Self = zerofs_create_with_exclusive;
+    const CALLBACK: Self = zerofs_create_with_exclusive::<I>;
 }
 
-unsafe extern "C" fn zerofs_create_with_exclusive(
-    idmap: *mut bindings::mnt_idmap,
+unsafe extern "C" fn zerofs_create_with_exclusive<I: IdmapArg>(
+    idmap: I,
     parent: *mut bindings::inode,
     dentry: *mut bindings::dentry,
     mode: bindings::umode_t,

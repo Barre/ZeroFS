@@ -30,6 +30,7 @@ pub(crate) enum Origin {
     UnbufferedRead,
     Writeback,
     WritebackSingle,
+    #[cfg_attr(not(zerofs_netfs_writethrough), allow(dead_code))]
     Writethrough,
     DioWrite,
     UnbufferedWrite,
@@ -44,6 +45,7 @@ impl Origin {
             abi::netfs_io_origin_NETFS_UNBUFFERED_READ => Self::UnbufferedRead,
             abi::netfs_io_origin_NETFS_WRITEBACK => Self::Writeback,
             abi::netfs_io_origin_NETFS_WRITEBACK_SINGLE => Self::WritebackSingle,
+            #[cfg(zerofs_netfs_writethrough)]
             abi::netfs_io_origin_NETFS_WRITETHROUGH => Self::Writethrough,
             abi::netfs_io_origin_NETFS_DIO_WRITE => Self::DioWrite,
             abi::netfs_io_origin_NETFS_UNBUFFERED_WRITE => Self::UnbufferedWrite,

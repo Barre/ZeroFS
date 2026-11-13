@@ -13,6 +13,12 @@ export ZEROFS_KBUILD_OUTPUT
 
 RUSTFLAGS_MODULE += -Copt-level=3 -Cembed-bitcode=y
 
+# Linux 7.4 removed netfslib's writethrough path along with its request origin.
+# Probe the header rather than the release so distribution backports build.
+ifneq ($(shell grep -qw NETFS_WRITETHROUGH $(srctree)/include/linux/netfs.h && echo y),)
+RUSTFLAGS_MODULE += --cfg zerofs_netfs_writethrough
+endif
+
 # Implementation-facing C APIs omitted from the canonical Rust bindings or
 # exposed there only as opaque types.
 zerofs_bindgen_common_flags := \
@@ -34,7 +40,10 @@ zerofs_bindgen_target := $(zerofs_bindgen_target_$(SRCARCH))
 zerofs_bindgen_arch_flags_x86 := -m64 -march=x86-64
 zerofs_bindgen_arch_flags_arm64 := -mlittle-endian
 zerofs_bindgen_arch_flags := $(zerofs_bindgen_arch_flags_$(SRCARCH))
-zerofs_bindgen_compiler_flags := $(filter -DCC_USING_%,$(KBUILD_CFLAGS))
+# Architecture headers can gate whole sections on KBUILD_CPPFLAGS defines,
+# such as arm64's ARM64_S390_COMMON in Linux 7.4.
+zerofs_bindgen_compiler_flags := $(filter -DCC_USING_%,$(KBUILD_CFLAGS)) \
+	$(filter -D%,$(KBUILD_CPPFLAGS))
 
 ifeq ($(zerofs_bindgen_target),)
 $(error ZeroFS does not support Kbuild architecture $(SRCARCH))
@@ -96,6 +105,8 @@ zerofs_netfs_bindgen_flags := \
 	$(zerofs_bindgen_common_flags) \
 	--allowlist-type 'netfs_.*' \
 	--allowlist-type 'rolling_buffer' \
+	--allowlist-type 'fscache_occupancy' \
+	--opaque-type 'fscache_occupancy' \
 	--allowlist-function 'netfs_.*' \
 	--allowlist-var 'NETFS_.*'
 
