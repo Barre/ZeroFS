@@ -10,11 +10,12 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::{
     DirectoryInode, FileInode, Inode, InodeId, MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR, SpecialInode,
 };
-use crate::fs::permissions::{AccessMode, Credentials, check_access, validate_mode};
+use crate::fs::permissions::{
+    AccessMode, Credentials, check_access, new_entry_gid, strip_sgid_unless_member, validate_mode,
+};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
-    AuthContext, FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetTime,
-    SetUid,
+    AuthContext, FileAttributes, FileType, InodeWithId, SetAttributes, SetMode, SetTime, SetUid,
 };
 use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{ZeroFS, get_current_time, validate_filename};
@@ -102,10 +103,15 @@ impl ZeroFS {
 
                 let (now_sec, now_nsec) = get_current_time();
 
-                let final_mode = match &attr.mode {
-                    SetMode::Set(m) => validate_mode(*m),
-                    SetMode::NoChange => 0o666,
-                };
+                let new_gid = new_entry_gid(dir, &attr.gid, creds);
+                let final_mode = strip_sgid_unless_member(
+                    match &attr.mode {
+                        SetMode::Set(m) => validate_mode(*m),
+                        SetMode::NoChange => 0o666,
+                    },
+                    new_gid,
+                    creds,
+                );
 
                 let file_inode = Inode::File(FileInode {
                     size: 0,
@@ -120,10 +126,7 @@ impl ZeroFS {
                         SetUid::Set(u) => *u,
                         SetUid::NoChange => creds.uid,
                     },
-                    gid: match &attr.gid {
-                        SetGid::Set(g) => *g,
-                        SetGid::NoChange => creds.gid,
-                    },
+                    gid: new_gid,
                     parent: Some(dirid),
                     name: Some(name.to_vec()),
                     nlink: 1,
@@ -287,8 +290,7 @@ impl ZeroFS {
                     SetMode::NoChange => 0o777,
                 };
 
-                let parent_mode = dir.mode;
-                if parent_mode & 0o2000 != 0 {
+                if dir.mode & 0o2000 != 0 {
                     new_mode |= 0o2000;
                 }
 
@@ -297,16 +299,7 @@ impl ZeroFS {
                     SetUid::NoChange => creds.uid,
                 };
 
-                let new_gid = match &attr.gid {
-                    SetGid::Set(g) => *g,
-                    SetGid::NoChange => {
-                        if parent_mode & 0o2000 != 0 {
-                            dir.gid
-                        } else {
-                            creds.gid
-                        }
-                    }
-                };
+                let new_gid = new_entry_gid(dir, &attr.gid, creds);
 
                 let (atime_sec, atime_nsec) = match &attr.atime {
                     SetTime::SetToClientTime(ts) => (ts.seconds, ts.nanoseconds),
@@ -500,11 +493,16 @@ impl ZeroFS {
                     _ => return Err(FsError::InvalidArgument),
                 };
 
-                let final_mode = if let SetMode::Set(m) = attr.mode {
-                    validate_mode(m)
-                } else {
-                    base_mode
-                };
+                let new_gid = new_entry_gid(dir, &attr.gid, creds);
+                let final_mode = strip_sgid_unless_member(
+                    if let SetMode::Set(m) = attr.mode {
+                        validate_mode(m)
+                    } else {
+                        base_mode
+                    },
+                    new_gid,
+                    creds,
+                );
 
                 let special_inode = SpecialInode {
                     mtime: now_sec,
@@ -518,10 +516,7 @@ impl ZeroFS {
                         SetUid::Set(u) => u,
                         _ => creds.uid,
                     },
-                    gid: match attr.gid {
-                        SetGid::Set(g) => g,
-                        _ => creds.gid,
-                    },
+                    gid: new_gid,
                     parent: Some(dirid),
                     name: Some(name.to_vec()),
                     nlink: 1,
@@ -615,7 +610,7 @@ mod tests {
     use crate::fs::*;
     use crate::test_helpers::test_helpers_mod::test_auth;
 
-    use crate::fs::inode::Inode;
+    use crate::fs::inode::{Inode, InodeAttrs};
     use crate::fs::key_codec::KeyCodec;
 
     use crate::fs::types::{FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid};
@@ -855,5 +850,227 @@ mod tests {
             fattr.mtime.seconds, 1234567890,
             "Custom mtime should be applied"
         );
+    }
+
+    /// Differs from `test_creds`'s gid so inheritance is observable.
+    const SETGID_PARENT_GID: u32 = 2000;
+
+    async fn setgid_dir(fs: &ZeroFS, name: &[u8]) -> InodeId {
+        let (id, _) = fs
+            .mkdir(
+                &test_creds(),
+                0,
+                name,
+                &SetAttributes {
+                    mode: SetMode::Set(0o2775),
+                    gid: SetGid::Set(SETGID_PARENT_GID),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn create_and_mknod_strip_sgid_for_non_members() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let dir = setgid_dir(&fs, b"sgid-mode").await;
+        let non_member = test_creds();
+        let mut supplementary_member = non_member;
+        supplementary_member.groups[0] = SETGID_PARENT_GID;
+        supplementary_member.groups_count = 1;
+        let primary_member = non_member.with_gid(SETGID_PARENT_GID);
+        let mut root = non_member;
+        root.uid = 0;
+        let mut incomplete_groups = non_member;
+        incomplete_groups.groups_complete = false;
+
+        let cases = [
+            ("non_member", non_member, SetGid::NoChange, 2000, false),
+            (
+                "primary_member",
+                primary_member,
+                SetGid::NoChange,
+                2000,
+                true,
+            ),
+            (
+                "supplementary_member",
+                supplementary_member,
+                SetGid::NoChange,
+                2000,
+                true,
+            ),
+            ("root", root, SetGid::NoChange, 2000, true),
+            (
+                "incomplete_groups",
+                incomplete_groups,
+                SetGid::NoChange,
+                2000,
+                true,
+            ),
+            ("explicit_member", non_member, SetGid::Set(1000), 1000, true),
+            (
+                "explicit_non_member",
+                primary_member,
+                SetGid::Set(4242),
+                4242,
+                false,
+            ),
+        ];
+
+        for (name, creds, gid, expected_gid, keep_sgid) in cases {
+            let attr = SetAttributes {
+                mode: SetMode::Set(0o2755),
+                gid,
+                ..Default::default()
+            };
+            for is_mknod in [false, true] {
+                let entry = format!("{name}-{}", if is_mknod { "fifo" } else { "file" });
+                let (id, attrs) = if is_mknod {
+                    fs.mknod(&creds, dir, entry.as_bytes(), FileType::Fifo, &attr, None)
+                        .await
+                        .unwrap()
+                } else {
+                    fs.create(&creds, dir, entry.as_bytes(), &attr)
+                        .await
+                        .unwrap()
+                };
+                let expected_mode = if keep_sgid { 0o2755 } else { 0o755 };
+                assert_eq!(attrs.gid, expected_gid, "{entry}");
+                assert_eq!(attrs.mode, expected_mode, "{entry}");
+                let inode = fs.inode_store.get(id).await.unwrap();
+                assert_eq!(inode.gid(), expected_gid, "stored {entry}");
+                assert_eq!(inode.mode(), expected_mode, "stored {entry}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_file_inherits_setgid_parent_group() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let dir = setgid_dir(&fs, b"sgid").await;
+
+        let (_, attrs) = fs
+            .create(&test_creds(), dir, b"file", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            attrs.gid, SETGID_PARENT_GID,
+            "file should inherit the setgid group"
+        );
+        assert_eq!(
+            attrs.mode & 0o2000,
+            0,
+            "a regular file does not inherit the setgid bit itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_file_in_non_setgid_dir_keeps_caller_group() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (dir, _) = fs
+            .mkdir(&test_creds(), 0, b"plain", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let (_, attrs) = fs
+            .create(&test_creds(), dir, b"file", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        assert_eq!(attrs.gid, 1000, "gid should come from the caller");
+    }
+
+    #[tokio::test]
+    async fn create_file_explicit_gid_overrides_setgid_inheritance() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let dir = setgid_dir(&fs, b"sgid").await;
+
+        let (_, attrs) = fs
+            .create(
+                &test_creds(),
+                dir,
+                b"file",
+                &SetAttributes {
+                    gid: SetGid::Set(4242),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(attrs.gid, 4242, "an explicit gid must win");
+    }
+
+    #[tokio::test]
+    async fn create_file_inherits_through_nested_setgid_dirs() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let outer = setgid_dir(&fs, b"outer").await;
+        let (inner, inner_attrs) = fs
+            .mkdir(&test_creds(), outer, b"inner", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            inner_attrs.mode & 0o2000,
+            0o2000,
+            "subdirectory should inherit the setgid bit"
+        );
+
+        let (_, attrs) = fs
+            .create(&test_creds(), inner, b"file", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        assert_eq!(attrs.gid, SETGID_PARENT_GID);
+    }
+
+    #[tokio::test]
+    async fn mknod_inherits_setgid_parent_group() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let dir = setgid_dir(&fs, b"sgid").await;
+
+        let (_, attrs) = fs
+            .mknod(
+                &test_creds(),
+                dir,
+                b"fifo",
+                FileType::Fifo,
+                &SetAttributes::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            attrs.gid, SETGID_PARENT_GID,
+            "fifo should inherit the setgid group"
+        );
+    }
+
+    #[tokio::test]
+    async fn mknod_in_non_setgid_dir_keeps_caller_group() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (dir, _) = fs
+            .mkdir(&test_creds(), 0, b"plain", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let (_, attrs) = fs
+            .mknod(
+                &test_creds(),
+                dir,
+                b"fifo",
+                FileType::Fifo,
+                &SetAttributes::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(attrs.gid, 1000);
     }
 }

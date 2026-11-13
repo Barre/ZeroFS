@@ -8,12 +8,10 @@ use fp::fail_point;
 use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId, SymlinkInode};
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::{AccessMode, Credentials, check_access, new_entry_gid};
 use crate::fs::store::inode::MAX_HARDLINKS_PER_INODE;
 use crate::fs::tracing::FileOperation;
-use crate::fs::types::{
-    AuthContext, FileAttributes, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
-};
+use crate::fs::types::{AuthContext, FileAttributes, InodeWithId, SetAttributes, SetMode, SetUid};
 use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{ZeroFS, get_current_time, validate_filename};
 use ::tracing::debug;
@@ -94,10 +92,7 @@ impl ZeroFS {
             SetUid::NoChange => creds.uid,
         };
 
-        let gid = match &attr.gid {
-            SetGid::Set(g) => *g,
-            SetGid::NoChange => creds.gid,
-        };
+        let gid = new_entry_gid(dir, &attr.gid, creds);
 
         let (now_sec, now_nsec) = get_current_time();
         let symlink_inode = Inode::Symlink(SymlinkInode {
@@ -433,7 +428,7 @@ mod tests {
     use crate::test_helpers::test_helpers_mod::test_auth;
 
     use crate::fs::store::inode::MAX_HARDLINKS_PER_INODE;
-    use crate::fs::types::{FileType, SetAttributes};
+    use crate::fs::types::{FileType, SetAttributes, SetGid, SetMode};
     use futures::StreamExt;
 
     async fn readlink_at(fs: &ZeroFS, dirid: InodeId, name: &[u8]) -> Vec<u8> {
@@ -827,6 +822,76 @@ mod tests {
             Inode::File(file) => {
                 assert_eq!(file.nlink, MAX_HARDLINKS_PER_INODE);
             }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn symlink_inherits_setgid_parent_group() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (dir, _) = fs
+            .mkdir(
+                &test_creds(),
+                0,
+                b"sgid",
+                &SetAttributes {
+                    mode: SetMode::Set(0o2775),
+                    gid: SetGid::Set(2000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let (_, attrs) = fs
+            .symlink(
+                &test_creds(),
+                dir,
+                b"target",
+                b"link",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(attrs.gid, 2000, "symlink should inherit the setgid group");
+    }
+
+    #[tokio::test]
+    async fn hardlink_keeps_source_group() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (dir, _) = fs
+            .mkdir(
+                &test_creds(),
+                0,
+                b"sgid",
+                &SetAttributes {
+                    mode: SetMode::Set(0o2775),
+                    gid: SetGid::Set(1000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (src, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"src",
+                &SetAttributes {
+                    gid: SetGid::Set(555),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        fs.link(&(&test_auth()).into(), src, dir, b"hard")
+            .await
+            .unwrap();
+        let inode = fs.inode_store.get(src).await.unwrap();
+        match inode {
+            Inode::File(file) => assert_eq!(file.gid, 555, "hard link must not change the group"),
             _ => panic!("Expected file inode"),
         }
     }
