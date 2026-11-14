@@ -30,17 +30,17 @@ jobs:
         shell: bash kernel/ci/ci-shell.sh {0}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch the prebuilt ZeroFS binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci
 
       - name: Cache the Ubuntu guest image
         if: matrix.mount-client == 'native'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.tool_cache }}/zerofs-qemu/ubuntu-26.04-server-cloudimg-amd64-20260720.img
           key: zerofs-qemu-ubuntu-26.04-amd64-20260720
@@ -52,7 +52,7 @@ jobs:
 
       - name: Set up JDK 17
         if: matrix.mount-client == 'fuse'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -188,7 +188,7 @@ jobs:
 
       - name: Upload jepsen store on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jepsen-ha-store-${{ matrix.mount-client }}
           path: |
@@ -237,17 +237,17 @@ jobs:
         shell: bash kernel/ci/ci-shell.sh {0}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch the prebuilt ZeroFS binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci
 
       - name: Cache the Ubuntu guest image
         if: matrix.mount-client == 'native'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.tool_cache }}/zerofs-qemu/ubuntu-26.04-server-cloudimg-amd64-20260720.img
           key: zerofs-qemu-ubuntu-26.04-amd64-20260720
@@ -259,7 +259,7 @@ jobs:
 
       - name: Set up JDK 17
         if: matrix.mount-client == 'fuse'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -361,7 +361,7 @@ jobs:
 
       - name: Upload jepsen store on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jepsen-ha-store-${{ matrix.mount-client }}-${{ matrix.scenario }}
           path: |

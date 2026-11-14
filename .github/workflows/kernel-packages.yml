@@ -38,12 +38,12 @@ jobs:
       matrix: ${{ steps.resolve.outputs.matrix }}
       package_version: ${{ steps.audit.outputs.version }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: tooling
           persist-credentials: false
 
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ inputs.source-package-artifact == '' }}
         with:
           path: source
@@ -76,7 +76,7 @@ jobs:
 
       - name: Download published kernel-client packages
         if: ${{ inputs.source-package-artifact != '' }}
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ inputs.source-package-artifact }}
           path: staged
@@ -89,7 +89,7 @@ jobs:
             staged/deb/*.deb staged/rpm/*.rpm)
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ inputs.publish-modules }}
         with:
           name: zerofs-kernel-package-metadata
@@ -102,7 +102,7 @@ jobs:
           tooling/kernel/ci/dkms-package-install-smoke.sh \
             staged/deb/*.deb staged/rpm/*.rpm
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ inputs.source-package-artifact == '' }}
         with:
           name: zerofs-kernel-source-packages
@@ -121,12 +121,12 @@ jobs:
     env:
       ZEROFS_KERNEL_ARTIFACT_DIR: /tmp/zerofs-kernel-${{ matrix.id }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: tooling
           persist-credentials: false
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ inputs.source-package-artifact || 'zerofs-kernel-source-packages' }}
           path: kernel-packages
@@ -149,7 +149,7 @@ jobs:
 
       - name: Upload target artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: zerofs-kernel-${{ matrix.id }}
           path: ${{ env.ZEROFS_KERNEL_ARTIFACT_DIR }}
@@ -158,7 +158,7 @@ jobs:
 
       - name: Upload unsigned module
         if: ${{ success() && inputs.publish-modules }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: zerofs-unsigned-module-${{ matrix.id }}
           path: ${{ env.ZEROFS_KERNEL_ARTIFACT_DIR }}/zerofs.ko
@@ -174,17 +174,17 @@ jobs:
     env:
       LC_ALL: C
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: tooling
           persist-credentials: false
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: zerofs-unsigned-module-*
           path: kernel-artifacts
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: zerofs-kernel-package-metadata
           path: package-metadata
@@ -237,7 +237,7 @@ jobs:
             --objcopy-tool llvm-objcopy \
             --output staged
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: zerofs-signed-kernel-modules
           path: staged
@@ -264,23 +264,23 @@ jobs:
     env:
       ZEROFS_KERNEL_ARTIFACT_DIR: /tmp/zerofs-kernel-${{ matrix.id }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: tooling
           persist-credentials: false
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: zerofs-kernel-${{ matrix.id }}
           path: ${{ env.ZEROFS_KERNEL_ARTIFACT_DIR }}
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: ${{ inputs.publish-modules }}
         with:
           name: zerofs-signed-kernel-modules
           path: signed
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci
@@ -343,7 +343,7 @@ jobs:
     env:
       LC_ALL: C
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: zerofs-signed-kernel-modules
           path: staged
