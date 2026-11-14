@@ -22,9 +22,9 @@ jobs:
     name: Build WebUI
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
@@ -48,7 +48,7 @@ jobs:
         run: make webui
 
       - name: Upload WebUI dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: webui-dist
           path: webui/dist/
@@ -84,7 +84,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
         if: matrix.platform != 'freebsd'
@@ -93,7 +93,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Download WebUI dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: webui-dist
           path: webui/dist/
@@ -150,7 +150,7 @@ jobs:
           chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: zerofs-${{ matrix.platform }}-${{ matrix.arch }}
           path: artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
@@ -164,7 +164,7 @@ jobs:
     
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -187,7 +187,7 @@ jobs:
           sha256sum zerofs-multiplatform.tar.gz > zerofs-multiplatform.tar.gz.sha256
 
       - name: Upload combined artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: zerofs-multiplatform
           path: |

@@ -32,7 +32,7 @@ jobs:
       AWS_DEFAULT_REGION: "us-east-1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Start SeaweedFS
         run: bash .github/scripts/seaweedfs.sh start test-bucket

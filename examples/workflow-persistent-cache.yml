@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       
       # Setup persistent cache volume
       - name: Setup ZeroFS Cache
@@ -24,9 +24,9 @@ jobs:
       
       # Example: Node.js with persistent npm cache
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
       
       - name: Configure npm cache
         run: |

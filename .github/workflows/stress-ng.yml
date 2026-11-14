@@ -15,7 +15,7 @@ jobs:
         os: [ubuntu-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Start SeaweedFS
         run: bash .github/scripts/seaweedfs.sh start zerofs-stress-test
@@ -26,7 +26,7 @@ jobs:
           sudo apt-get install -y nfs-common stress-ng
 
       - name: Fetch the prebuilt ZeroFS binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci
@@ -127,10 +127,10 @@ jobs:
         shell: bash kernel/ci/ci-shell.sh {0}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch the prebuilt ZeroFS binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci
@@ -141,7 +141,7 @@ jobs:
 
       - name: Cache the Ubuntu guest image
         if: matrix.client == 'native'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.tool_cache }}/zerofs-qemu/ubuntu-26.04-server-cloudimg-amd64-20260720.img
           key: zerofs-qemu-ubuntu-26.04-amd64-20260720
@@ -276,7 +276,7 @@ jobs:
         os: [ubuntu-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Start SeaweedFS
         run: bash .github/scripts/seaweedfs.sh start zerofs-stress-test
@@ -287,7 +287,7 @@ jobs:
           sudo apt-get install -y stress-ng fuse3
 
       - name: Fetch the prebuilt ZeroFS binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci

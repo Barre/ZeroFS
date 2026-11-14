@@ -14,7 +14,7 @@ jobs:
     name: csi-sanity conformance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install fuse3
         run: |
@@ -26,13 +26,13 @@ jobs:
           test "$(command -v fusermount3)" = /usr/bin/fusermount3
 
       - name: Fetch the prebuilt binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci
       - run: chmod +x zerofs/target/ci/zerofs zerofs/target/ci/zerofs-csi
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
 

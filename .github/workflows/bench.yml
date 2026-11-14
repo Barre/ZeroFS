@@ -30,7 +30,7 @@ jobs:
       run:
         working-directory: bench
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check formatting
         run: cargo fmt -- --check
 
@@ -41,7 +41,7 @@ jobs:
       run:
         working-directory: bench
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Run clippy
         run: cargo clippy -- -D warnings
@@ -53,7 +53,7 @@ jobs:
       run:
         working-directory: bench
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --verbose
@@ -62,7 +62,7 @@ jobs:
       - name: Verify CLI works
         run: cargo run -- run --list
       - name: Upload benchmark binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-linux-x64
           path: bench/target/release/bench
@@ -74,12 +74,12 @@ jobs:
       run:
         working-directory: bench
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build release
         run: cargo build --release --verbose
       - name: Upload benchmark binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-macos-arm64
           path: bench/target/release/bench

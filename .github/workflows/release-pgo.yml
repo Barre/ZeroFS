@@ -20,7 +20,7 @@ jobs:
     name: Build instrumented binary for profiling
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust with PGO support
         uses: dtolnay/rust-toolchain@stable
@@ -46,7 +46,7 @@ jobs:
       # profile output path is chosen at runtime via LLVM_PROFILE_FILE, so the
       # same binary profiles 9p/fuse/zfs/nfs without a rebuild per matrix leg.
       - name: Upload instrumented binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: zerofs-instrumented
           path: zerofs/target/x86_64-unknown-linux-musl/release/zerofs
@@ -61,7 +61,7 @@ jobs:
         test: [9p, fuse, zfs-on-zerofs, nfs-kernel-compile]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # llvm-tools-preview supplies llvm-profdata for the merge step; no
       # compilation happens here, so the musl target/toolchain aren't needed.
@@ -71,7 +71,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Download instrumented binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: zerofs-instrumented
           path: zerofs/target/x86_64-unknown-linux-musl/release/
@@ -340,7 +340,7 @@ jobs:
           cp zerofs/Cargo.lock pgo-data/
 
       - name: Upload PGO profile data
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pgo-profile-data-${{ matrix.test }}
           path: pgo-data/
@@ -351,7 +351,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust with PGO support
         uses: dtolnay/rust-toolchain@stable
@@ -359,7 +359,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Download all PGO profile data
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: pgo-profile-data-*
           path: pgo-artifacts/
@@ -380,7 +380,7 @@ jobs:
           cp pgo-artifacts/pgo-profile-data-*/Cargo.lock pgo-data/ || true
 
       - name: Upload merged PGO profile data
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pgo-profile-data-merged
           path: pgo-data/
@@ -389,9 +389,9 @@ jobs:
     name: Build WebUI
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: "npm"
@@ -415,7 +415,7 @@ jobs:
         run: make webui
 
       - name: Upload WebUI dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: webui-dist
           path: webui/dist/
@@ -458,16 +458,16 @@ jobs:
             platform: freebsd
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download PGO profile data
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pgo-profile-data-merged
           path: pgo-data/
 
       - name: Download WebUI dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: webui-dist
           path: webui/dist/
@@ -657,12 +657,12 @@ jobs:
           ls -lh artifacts/
 
       - name: Generate attestation for binary
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
           path: artifacts/
@@ -679,7 +679,7 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: zerofs-*-pgo
@@ -698,7 +698,7 @@ jobs:
           sha256sum zerofs-pgo-multiplatform.tar.gz > zerofs-pgo-multiplatform.tar.gz.sha256
 
       - name: Upload combined release
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: zerofs-pgo-release
           path: |
@@ -707,7 +707,7 @@ jobs:
           retention-days: 90
 
       - name: Generate attestations
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             zerofs-pgo-multiplatform.tar.gz

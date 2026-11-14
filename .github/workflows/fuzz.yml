@@ -38,7 +38,7 @@ jobs:
       run:
         working-directory: zerofs/${{ matrix.crate }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
@@ -50,7 +50,7 @@ jobs:
         run: cargo fuzz run decode -- -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts-${{ matrix.crate }}-${{ github.run_id }}
           path: zerofs/${{ matrix.crate }}/fuzz/artifacts/

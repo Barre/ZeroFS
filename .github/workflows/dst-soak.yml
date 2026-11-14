@@ -32,7 +32,7 @@ jobs:
       run:
         working-directory: zerofs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Soak
         run: >
@@ -42,7 +42,7 @@ jobs:
           cargo test --profile ci --test dst -- --nocapture seeds
       - name: Upload divergence traces
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dst-traces-${{ github.run_id }}
           path: /tmp/dst_trace_*.log

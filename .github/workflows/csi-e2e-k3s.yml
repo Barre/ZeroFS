@@ -14,10 +14,10 @@ jobs:
     name: k3s end-to-end
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch the prebuilt binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci

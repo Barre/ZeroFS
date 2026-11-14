@@ -15,10 +15,10 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -40,7 +40,7 @@ jobs:
           lein version
 
       - name: Fetch the prebuilt ZeroFS binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci
@@ -106,7 +106,7 @@ jobs:
 
       - name: Upload jepsen store on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jepsen-store
           path: /tmp/local-fs/store
