@@ -41,6 +41,10 @@ This GitHub Action provides persistent volumes backed by S3-compatible storage f
 | `mount-path` | Path where the volume is mounted |
 | `nfs-endpoint` | NFS endpoint (host:port) |
 
+## Shutdown
+
+When the job ends, a post step unmounts the volume and stops ZeroFS with SIGTERM so it flushes pending writes to the object store. The post step fails the job if the final flush does not complete within 5 minutes.
+
 ## Examples
 
 See the [examples](examples/) directory for complete workflow examples.

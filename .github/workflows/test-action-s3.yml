@@ -21,6 +21,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # Also read by verify-action-persistence.sh.
+    env:
+      OBJECT_STORE_URL: "s3://test-bucket/github-actions-test"
+      ZEROFS_ENCRYPTION_PASSWORD: "test-password-123"
+      AWS_ACCESS_KEY_ID: "zerofsadmin"
+      AWS_SECRET_ACCESS_KEY: "zerofsadmin"
+      AWS_ENDPOINT: "http://localhost:9000"
+      AWS_ALLOW_HTTP: "true"
+      AWS_DEFAULT_REGION: "us-east-1"
 
     steps:
       - uses: actions/checkout@v4
@@ -28,17 +37,23 @@ jobs:
       - name: Start SeaweedFS
         run: bash .github/scripts/seaweedfs.sh start test-bucket
 
+      # Post steps run in reverse order, so this checks after the action's cleanup.
+      - name: Verify the volume persists after shutdown
+        uses: ./.github/actions/post-run
+        with:
+          run: bash .github/scripts/verify-action-persistence.sh test-dir/test.txt "Hello from GitHub Actions on ${{ matrix.os }}!"
+
       - name: Setup ZeroFS Volume
         id: setup-zerofs
         uses: ./
         with:
-          object-store-url: "s3://test-bucket/github-actions-test"
-          encryption-password: "test-password-123"
-          aws-access-key-id: "zerofsadmin"
-          aws-secret-access-key: "zerofsadmin"
-          aws-endpoint: "http://localhost:9000"
-          aws-allow-http: "true"
-          aws-region: "us-east-1"
+          object-store-url: ${{ env.OBJECT_STORE_URL }}
+          encryption-password: ${{ env.ZEROFS_ENCRYPTION_PASSWORD }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-endpoint: ${{ env.AWS_ENDPOINT }}
+          aws-allow-http: ${{ env.AWS_ALLOW_HTTP }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
           cache-size-gb: "1"
           mount-path: "/mnt/zerofs-test"
 

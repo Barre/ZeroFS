@@ -86,8 +86,12 @@ fi
 
 sudo mkdir -p "$MOUNT_PATH"
 
-# Create ZeroFS configuration file
-cat > zerofs-action.toml << EOF
+# Outside the workspace and mode 0700, since the config holds secrets.
+STATE_DIR=$(mktemp -d "$RUNNER_TEMP/zerofs.XXXXXX")
+CONFIG="$STATE_DIR/zerofs.toml"
+LOG="$STATE_DIR/zerofs.log"
+
+cat > "$CONFIG" << EOF
 [cache]
 dir = "$SLATEDB_CACHE_DIR"
 disk_size_gb = $SLATEDB_CACHE_SIZE_GB
@@ -103,7 +107,7 @@ EOF
 
 # Add AWS config if credentials are provided
 if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-    cat >> zerofs-action.toml << EOF
+    cat >> "$CONFIG" << EOF
 
 [aws]
 access_key_id = "$AWS_ACCESS_KEY_ID"
@@ -113,16 +117,16 @@ EOF
     
     # Add optional AWS settings
     if [ -n "${AWS_ENDPOINT:-}" ]; then
-        echo "endpoint = \"$AWS_ENDPOINT\"" >> zerofs-action.toml
+        echo "endpoint = \"$AWS_ENDPOINT\"" >> "$CONFIG"
     fi
     if [ "$AWS_ALLOW_HTTP" = "true" ]; then
-        echo "allow_http = \"true\"" >> zerofs-action.toml
+        echo "allow_http = \"true\"" >> "$CONFIG"
     fi
 fi
 
 # Add Azure config if credentials are provided
 if [ -n "${AZURE_STORAGE_ACCOUNT_NAME:-}" ] && [ -n "${AZURE_STORAGE_ACCOUNT_KEY:-}" ]; then
-    cat >> zerofs-action.toml << EOF
+    cat >> "$CONFIG" << EOF
 
 [azure]
 storage_account_name = "$AZURE_STORAGE_ACCOUNT_NAME"
@@ -142,9 +146,12 @@ for var in $(compgen -e); do
     esac
 done
 
-nohup /usr/local/bin/zerofs run -c zerofs-action.toml > zerofs.log 2>&1 &
-ZEROFS_PID=$!
-echo $ZEROFS_PID > zerofs.pid
+# Records the exit status, which the post step cannot wait() for.
+nohup sh -c '"$1" run -c "$2" & echo $! > "$3/pid"; wait $!
+    echo $? > "$3/exit.tmp" && mv "$3/exit.tmp" "$3/exit"' \
+    _ /usr/local/bin/zerofs "$CONFIG" "$STATE_DIR" > "$LOG" 2>&1 &
+# Before anything can fail, so the post step still stops it.
+echo "state_dir=$STATE_DIR" >> "$GITHUB_STATE"
 
 echo "Waiting for ZeroFS to start..."
 for i in {1..30}; do
@@ -154,7 +161,7 @@ for i in {1..30}; do
     fi
     if [ $i -eq 30 ]; then
         echo "::error::ZeroFS failed to start within 30 seconds"
-        cat zerofs.log
+        cat "$LOG"
         exit 1
     fi
     sleep 1
@@ -163,10 +170,10 @@ done
 echo "Mounting ZeroFS..."
 case "$OS" in
     linux)
-        sudo mount -t nfs -o vers=3,async,nolock,tcp,port="$ZEROFS_NFS_HOST_PORT",mountport="$ZEROFS_NFS_HOST_PORT",hard "$ZEROFS_NFS_HOST":/ "$MOUNT_PATH"
+        MOUNT_OPTS="vers=3,async,nolock,tcp,port=$ZEROFS_NFS_HOST_PORT,mountport=$ZEROFS_NFS_HOST_PORT,hard"
         ;;
     darwin)
-        sudo mount -t nfs -o async,nolocks,vers=3,tcp,port="$ZEROFS_NFS_HOST_PORT",mountport="$ZEROFS_NFS_HOST_PORT",hard "$ZEROFS_NFS_HOST":/ "$MOUNT_PATH"
+        MOUNT_OPTS="async,nolocks,vers=3,tcp,port=$ZEROFS_NFS_HOST_PORT,mountport=$ZEROFS_NFS_HOST_PORT,hard"
         ;;
     *)
         echo "::error::Mounting is not supported on OS: $OS"
@@ -174,50 +181,20 @@ case "$OS" in
         ;;
 esac
 
-if mount | grep -q "$MOUNT_PATH"; then
-    echo "ZeroFS successfully mounted at: $MOUNT_PATH"
-    df -h "$MOUNT_PATH"
-else
+if ! sudo mount -t nfs -o "$MOUNT_OPTS" "$ZEROFS_NFS_HOST":/ "$MOUNT_PATH"; then
     echo "::error::Failed to mount ZeroFS"
-    cat zerofs.log
+    cat "$LOG"
     exit 1
 fi
+# Resolved because macOS lists /tmp mounts under /private/tmp.
+MOUNT_PARENT=$(cd "$(dirname "$MOUNT_PATH")" && pwd -P)
+echo "mount_path=${MOUNT_PARENT%/}/$(basename "$MOUNT_PATH")" >> "$GITHUB_STATE"
 
-echo "mount-path=$MOUNT_PATH" >> $GITHUB_OUTPUT
-echo "nfs-endpoint=$ZEROFS_NFS_HOST:$ZEROFS_NFS_HOST_PORT" >> $GITHUB_OUTPUT
+echo "ZeroFS successfully mounted at: $MOUNT_PATH"
+df -h "$MOUNT_PATH"
 
-cat > cleanup-zerofs.sh << 'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "::group::Cleaning up ZeroFS"
-
-if mount | grep -q "$MOUNT_PATH"; then
-    echo "Unmounting $MOUNT_PATH..."
-    sudo umount "$MOUNT_PATH" || sudo umount -f "$MOUNT_PATH" || true
-fi
-
-if [ -f zerofs.pid ]; then
-    PID=$(cat zerofs.pid)
-    if kill -0 $PID 2>/dev/null; then
-        echo "Stopping ZeroFS (PID: $PID)..."
-        kill $PID || true
-        sleep 2
-        kill -9 $PID 2>/dev/null || true
-    fi
-    rm -f zerofs.pid
-fi
-
-if [ -f zerofs.log ] && grep -i error zerofs.log > /dev/null 2>&1; then
-    echo "::warning::ZeroFS had errors during execution:"
-    grep -i error zerofs.log | head -20
-fi
-
-echo "::endgroup::"
-EOF
-chmod +x cleanup-zerofs.sh
-
-echo "$PWD/cleanup-zerofs.sh" >> $GITHUB_PATH
+echo "mount-path=$MOUNT_PATH" >> "$GITHUB_OUTPUT"
+echo "nfs-endpoint=$ZEROFS_NFS_HOST:$ZEROFS_NFS_HOST_PORT" >> "$GITHUB_OUTPUT"
 
 echo "::endgroup::"
 echo "::notice::ZeroFS is ready! Volume mounted at: $MOUNT_PATH"

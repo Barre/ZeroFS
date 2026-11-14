@@ -81,33 +81,10 @@ inputs:
 outputs:
   mount-path:
     description: 'Path where the volume is mounted'
-    value: ${{ steps.setup-zerofs.outputs.mount-path }}
   nfs-endpoint:
     description: 'NFS endpoint (host:port)'
-    value: ${{ steps.setup-zerofs.outputs.nfs-endpoint }}
 
 runs:
-  using: 'composite'
-  steps:
-    - name: Setup ZeroFS
-      id: setup-zerofs
-      shell: bash
-      run: |
-        ${{ github.action_path }}/scripts/setup-zerofs.sh
-      env:
-        ZEROFS_VERSION: ${{ inputs.zerofs-version }}
-        OBJECT_STORE_URL: ${{ inputs.object-store-url }}
-        MOUNT_PATH: ${{ inputs.mount-path }}
-        SLATEDB_CACHE_DIR: ${{ inputs.cache-dir }}
-        SLATEDB_CACHE_SIZE_GB: ${{ inputs.cache-size-gb }}
-        ZEROFS_MEMORY_CACHE_SIZE_GB: ${{ inputs.memory-cache-size-gb }}
-        ZEROFS_ENCRYPTION_PASSWORD: ${{ inputs.encryption-password }}
-        AWS_ACCESS_KEY_ID: ${{ inputs.aws-access-key-id }}
-        AWS_SECRET_ACCESS_KEY: ${{ inputs.aws-secret-access-key }}
-        AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
-        AWS_ENDPOINT: ${{ inputs.aws-endpoint }}
-        AWS_ALLOW_HTTP: ${{ inputs.aws-allow-http }}
-        AZURE_STORAGE_ACCOUNT_NAME: ${{ inputs.azure-storage-account-name }}
-        AZURE_STORAGE_ACCOUNT_KEY: ${{ inputs.azure-storage-account-key }}
-        ZEROFS_NFS_HOST: ${{ inputs.nfs-host }}
-        ZEROFS_NFS_HOST_PORT: ${{ inputs.nfs-port }}
+  using: 'node24'
+  main: 'scripts/action/main.js'
+  post: 'scripts/action/post.js'

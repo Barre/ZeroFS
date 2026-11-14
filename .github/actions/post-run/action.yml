@@ -1,0 +1,11 @@
+name: 'Post-run command'
+description: 'Runs a command after the post steps of actions used later in the job'
+inputs:
+  run:
+    description: 'Bash command to run'
+    required: true
+runs:
+  using: 'node24'
+  main: 'main.js'
+  post: 'post.js'
+  post-if: success()
