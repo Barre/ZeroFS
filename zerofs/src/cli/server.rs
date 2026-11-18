@@ -695,7 +695,8 @@ pub async fn build_slatedb(
             {
                 let scheduler_options: std::collections::HashMap<String, String> =
                     slatedb::config::SizeTieredCompactionSchedulerOptions {
-                        max_compaction_sources: 16,
+                        // Tied to the L0 limit so one compaction can drain a full L0.
+                        max_compaction_sources: l0_max_ssts,
                         ..Default::default()
                     }
                     .into();
