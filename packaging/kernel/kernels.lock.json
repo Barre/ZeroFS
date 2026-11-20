@@ -10,30 +10,30 @@
       "architectures": {
         "x86_64": [
           {
-            "kernel": "7.0.0-38-generic",
-            "version": "7.0.0-38.38",
-            "source_version": "7.0.0-38.38",
-            "snapshot": "20261015T005723Z"
-          },
-          {
             "kernel": "7.0.0-43-generic",
             "version": "7.0.0-43.43",
             "source_version": "7.0.0-43.43",
             "snapshot": "20261113T152536Z"
+          },
+          {
+            "kernel": "7.0.0-44-generic",
+            "version": "7.0.0-44.44",
+            "source_version": "7.0.0-44.44",
+            "snapshot": "20261120T011732Z"
           }
         ],
         "aarch64": [
           {
-            "kernel": "7.0.0-38-generic",
-            "version": "7.0.0-38.38",
-            "source_version": "7.0.0-38.38",
-            "snapshot": "20261015T005723Z"
-          },
-          {
             "kernel": "7.0.0-43-generic",
             "version": "7.0.0-43.43",
             "source_version": "7.0.0-43.43",
             "snapshot": "20261113T152536Z"
+          },
+          {
+            "kernel": "7.0.0-44-generic",
+            "version": "7.0.0-44.44",
+            "source_version": "7.0.0-44.44",
+            "snapshot": "20261120T011732Z"
           }
         ]
       }
